@@ -37,8 +37,26 @@ def _hash(x: mx.array) -> str:
 
 
 def _blocks(model):
-    inner = getattr(model, "model", model)
-    return list(getattr(inner, "layers"))
+    """The transformer blocks: the first list of >= 2 same-class nn.Module
+    children found walking the model (``layers`` in most mlx_lm models,
+    ``h`` in gpt2, ...)."""
+    import mlx.nn as nn
+
+    def walk(mod):
+        for _, child in mod.children().items():
+            if isinstance(child, list) and len(child) >= 2 and all(isinstance(c, nn.Module) for c in child) \
+                    and len({type(c) for c in child}) == 1:
+                return child
+            if isinstance(child, nn.Module):
+                found = walk(child)
+                if found:
+                    return found
+        return None
+
+    blocks = walk(model)
+    if not blocks:
+        raise RuntimeError("could not find the transformer block list in this model")
+    return list(blocks)
 
 
 class Recorder:

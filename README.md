@@ -13,10 +13,9 @@ different bits at temperature 0 depending on server load. These kernels fix
 the reduction order per output element so the bits are identical at batch 1
 and batch 256.
 
-Status: **works end to end on `mlx_lm` models, unquantized and 4-bit**
-(Qwen2.5-0.5B bf16 and its 4-bit affine quantization): bitwise-identical
-logits at batch 1, 4, 16 and 64, in prefill and in cached decode, with no
-fallbacks. Matmul and decode attention run within 1.0–1.5x of stock MLX;
+Status: **works end to end on `mlx_lm` models across three architectures
+(Qwen2, Llama, GPT-2), unquantized and 4-bit**: bitwise-identical logits at
+batch 1, 4, 16 and 64, in prefill and in cached decode, with no fallbacks. Matmul and decode attention run within 1.0–1.5x of stock MLX;
 prefill attention is ~4x off; end-to-end generation on a 0.5B model is 1.2x
 slower (bf16) and 2.1x slower (4-bit). See *Results* and *Roadmap*.
 
@@ -177,6 +176,25 @@ Same model quantized locally to 4-bit affine, group 64 (`mlx_lm convert -q`,
 4.5 bits/weight), both modes: identical table, STOCK diverges at block 0,
 INVARIANT passes at B=4/16/64 with no fallbacks.
 
+Every model with complete weights in the local Hugging Face cache, both
+modes (`--decode` and plain), batch 4/16/64 against batch 1:
+
+| model | arch | blocks | notes | stock | invariant |
+|---|---|---|---|---|---|
+| Qwen/Qwen2.5-0.5B         | qwen2 | 24 | bf16, GQA 14/2, RMSNorm       | diverges @ block 0 | clean |
+| Qwen2.5-0.5B 4-bit (local) | qwen2 | 24 | affine 4-bit g64              | diverges @ block 0 | clean |
+| Qwen/Qwen2.5-Coder-0.5B   | qwen2 | 24 | bf16                          | diverges @ block 0 | clean |
+| HuggingFaceTB/SmolLM2-360M | llama | 32 | bf16, GQA 15/5                | diverges @ block 0–1 | clean |
+| SmolLM2-360M 4-bit (local) | llama | 32 | affine 4-bit g64              | diverges @ block 0 | clean |
+| gpt2                      | gpt2  | 12 | fp32, MHA, LayerNorm, bias linears (`addmm`) | diverges @ block 0 | clean |
+| gpt2-large                | gpt2  | 36 | fp32                          | diverges @ block 0 | clean |
+
+GPT-2 uses `mx.fast.layer_norm`, which the mode does not patch; stock
+`layer_norm` was probed batch-invariant at widths 768–4096 in fp16/fp32, so
+the GPT-2 result rests on that observation (a guaranteed kernel is on the
+roadmap). `bigscience/bloom-560m` is cached too but `mlx_lm` has no bloom
+model.
+
 No fallbacks were recorded in invariant mode, so every matmul, quantized
 matmul, norm and attention call in the model went through the
 batch-invariant kernels. Block 0 diverging under stock MLX is the GEMM
@@ -210,6 +228,10 @@ run, no fallbacks):
 | bf16  | invariant | 680  | 81.0 (0.85x) |
 | 4-bit | stock     | 1472 | 275.2 |
 | 4-bit | invariant | 847  | 129.6 (0.47x) |
+| SmolLM2-360M 4-bit | stock | 728 | 335.1 |
+| SmolLM2-360M 4-bit | invariant | 381 | 137.7 (0.41x) |
+| gpt2 (fp32) | stock | 737 | 180.1 |
+| gpt2 (fp32) | invariant | 436 | 154.0 (0.86x) |
 
 The 4-bit gap is the quantized matmul at M=1. Measured pipelined (100
 calls queued per eval) at this model's weight shapes, stock's 4-bit GEMV
@@ -264,7 +286,11 @@ bits across machines.
    prefill vs. from decoding tokens one at a time. The attention kernels
    guarantee it per op; the harness should assert it per model.
 8. Other quantization modes (`mxfp4`, `mxfp8`, `nvfp4`) and `transpose=False`.
-9. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
+9. A batch-invariant `mx.fast.layer_norm` so GPT-2-style models rest on a
+   guarantee rather than an observation.
+10. ~~Try other architectures~~ Done for Qwen2, Llama, GPT-2 (see the model
+   table); Gemma, Mistral, Phi and Qwen3 still untested (no cached weights).
+11. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
    fp16 weights; the Recorder hooks the block class, so most should work.
 
 ## Layout
