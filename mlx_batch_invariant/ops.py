@@ -13,7 +13,7 @@ from collections import Counter
 import mlx.core as mx
 
 from .kernels import (
-    batch_invariant_decode_attention,
+    batch_invariant_attention,
     batch_invariant_matmul,
     batch_invariant_rms_norm,
 )
@@ -71,10 +71,9 @@ def scaled_dot_product_attention(
     q, k, v, *, scale: float, mask=None, sinks=None, force_fused=False, stream=None
 ):
     if _attn.supports(q, k, v, mask, sinks):
-        handled["sdpa_decode"] += 1
-        return batch_invariant_decode_attention(q, k, v, scale=scale)
-    reason = "prefill" if (q.ndim == 4 and q.shape[2] > 1) else "mask-or-sinks-or-shape"
-    _fallback("sdpa", reason)
+        handled["sdpa_decode" if q.shape[2] == 1 else "sdpa_prefill"] += 1
+        return batch_invariant_attention(q, k, v, scale=scale, mask=mask)
+    _fallback("sdpa", "array-mask" if isinstance(mask, mx.array) else "sinks-or-shape")
     return _orig_sdpa(q, k, v, scale=scale, mask=mask, sinks=sinks, stream=stream)
 
 

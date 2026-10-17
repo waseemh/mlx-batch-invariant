@@ -49,7 +49,7 @@ functions that `mlx.nn` and `mlx_lm` reach for, and restores them on exit:
 | `mx.matmul`, `mx.array.__matmul__`        | `batch_invariant_matmul`               | rhs not 2-D, non-float dtype             |
 | `mx.addmm`                                | `batch_invariant_matmul` + add         | same                                     |
 | `mx.fast.rms_norm`                        | `batch_invariant_rms_norm`             | non-float                                |
-| `mx.fast.scaled_dot_product_attention`    | `batch_invariant_decode_attention`     | `T_q > 1` (prefill), array mask, sinks   |
+| `mx.fast.scaled_dot_product_attention`    | `batch_invariant_attention`            | array mask, sinks                        |
 
 Not patched: `mx.quantized_matmul` (quantized checkpoints), batched 3-D
 matmul, `mx.compile`d graphs that captured the stock ops before the mode was
@@ -63,11 +63,17 @@ entered.
   Reads the transposed weight view through strides, no copy.
 - **rms_norm** (`kernels/rmsnorm.py`): one 256-thread threadgroup per row,
   fixed-stride partial sums, fixed-shape tree reduction.
-- **decode attention** (`kernels/attention.py`): fixed split **size** along
-  KV (256 keys), not fixed split count. Key `j` always lands in split
-  `j // 256` at the same position, and splits are merged in index order, so
-  neither batch size nor cache growth changes an existing row's reduction.
-  Two kernels: per-split online softmax, then an ordered combine.
+- **attention** (`kernels/attention.py`): fixed split **size** along KV
+  (256 keys), not fixed split count. Key `j` always lands in split `j // 256`
+  at the same position, and splits are merged in index order, so neither
+  batch size nor cache growth changes an existing row's reduction. Decode
+  (`T_q == 1`) runs as per-split partials plus an ordered combine; prefill
+  runs one thread per query doing the *same* split loop and merge
+  sequentially. The inner loop and merge are literally the same source text
+  in all three kernels, which is what makes a token's attention output
+  bitwise identical whether it came from prefill or from a later decode
+  step. Causal masking follows MLX's convention (query `i` of `T` against a
+  cache of `L` sees keys `0..L-T+i`).
 
 ## Harness
 
@@ -79,7 +85,11 @@ entered.
 
 `harness.sweep` embeds a fixed probe row in batches of 1…256 at row 0 and at
 the last row, and compares the probe's output bitwise to its batch-1 result,
-for stock MLX and for the invariant mode. `harness.model_sweep` does the same
+for stock MLX and for the invariant mode. It then runs two attention
+structure checks the batch sweep cannot see: a 600-token prompt prefilled in
+one shot vs. in two chunks (257 + 343, deliberately off the 256 split), and
+the last token's output from prefill vs. from a decode step against the same
+cache. `harness.model_sweep` does the same
 through an `mlx_lm` model and reports the first transformer block whose
 output for the prompt row diverges. It has **not yet been run against a real
 checkpoint**.
@@ -105,13 +115,25 @@ rms_norm     *         STOCK      pass
 rms_norm     *         INVARIANT  pass
 sdpa_decode  *         STOCK      pass        (also at KV length 4k, 16k, 64k)
 sdpa_decode  *         INVARIANT  pass
+sdpa_prefill *         STOCK      pass
+sdpa_prefill *         INVARIANT  pass
+
+attention structure checks:
+sdpa  fp16  STOCK      chunked_prefill == full_prefill: pass
+sdpa  fp16  STOCK      decode(last) == prefill(last):   FAIL
+sdpa  bf16  STOCK      decode(last) == prefill(last):   pass
+sdpa  fp32  STOCK      decode(last) == prefill(last):   FAIL
+sdpa  *     INVARIANT  both checks:                     pass
 ```
 
-Takeaway so far: on MLX the batch dependence is in the GEMM (stock
+Takeaways so far: on MLX the batch dependence is in the GEMM (stock
 `mx.matmul` already differs between batch 1 and batch 2, K=N=4096). Stock
-`rms_norm` and decode SDPA were observed invariant up to 64k keys, so those
-two kernels currently turn an observation into a guarantee rather than fix a
-measured failure. That may change with other MLX versions or chips; the
+attention is batch-invariant here, but it is **not prefill/decode
+invariant**: the same token gets different bits from the prefill kernel and
+from a decode step (fp16, fp32). That is the trainer-vs-sampler mismatch the
+original post cares about for on-policy RL, and the shared-source kernels
+here close it. Stock `rms_norm` was observed invariant, so that kernel turns
+an observation into a guarantee rather than fixing a measured failure. That may change with other MLX versions or chips; the
 harness is the thing to trust, not this table.
 
 Determinism is per (MLX version, chip, macOS). Nothing here claims identical
@@ -119,9 +141,7 @@ bits across machines.
 
 ## Roadmap
 
-1. **Prefill attention** with chunk invariance (same bits whether a prompt is
-   processed in one chunk or several, and with prefix caching). Needed before
-   `model_sweep` is meaningful end to end.
+1. ~~Prefill attention with chunk invariance.~~ Done; see structure checks.
 2. **Run `model_sweep`** on an unquantized `mlx_lm` checkpoint; fix what it
    finds (embedding gather, lm_head, residual adds are candidates).
 3. **`mx.quantized_matmul`**: affine-dequant + fixed-order accumulate, so

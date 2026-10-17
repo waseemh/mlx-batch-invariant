@@ -132,7 +132,59 @@ class SDPADecode(Op):
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.D ** -0.5)
 
 
-OPS = {c.name: c for c in (Matmul, Addmm, RMSNorm, SDPADecode)}
+class SDPAPrefill(Op):
+    name = "sdpa_prefill"
+    Hq, Hkv, Tq, L, D = 8, 2, 48, 300, 128  # L > Tq: causal against a cache
+
+    def setup(self):
+        self.q0 = mx.random.normal((1, self.Hq, self.Tq, self.D)).astype(self.dt)
+        kv = (1, self.Hkv, self.L, self.D)
+        self.k0 = mx.random.normal(kv).astype(self.dt)
+        self.v0 = mx.random.normal(kv).astype(self.dt)
+
+    def make_batch(self, B, pos):
+        qs, ks, vs = [], [], []
+        for _ in range(B - 1):
+            qs.append(mx.random.normal(self.q0.shape).astype(self.dt))
+            ks.append(mx.random.normal(self.k0.shape).astype(self.dt))
+            vs.append(mx.random.normal(self.v0.shape).astype(self.dt))
+        qs.insert(pos, self.q0); ks.insert(pos, self.k0); vs.insert(pos, self.v0)
+        return (mx.concatenate(qs, 0), mx.concatenate(ks, 0), mx.concatenate(vs, 0))
+
+    def run(self, batch):
+        q, k, v = batch
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.D ** -0.5, mask="causal")
+
+
+OPS = {c.name: c for c in (Matmul, Addmm, RMSNorm, SDPADecode, SDPAPrefill)}
+
+
+# ---- sequence-structure checks (attention only) -----------------------------
+# These are the properties the batch sweep cannot see: the same token must get
+# the same bits whether its prompt was prefilled in one chunk or several, and
+# whether it was produced by the prefill kernel or by a later decode step.
+
+
+def attention_structure_checks(dt, invariant: bool, seed: int = 0) -> dict[str, bool]:
+    Hq, Hkv, D = 8, 2, 128
+    T, T1 = 600, 257  # T1 deliberately not a multiple of the 256 split
+    mx.random.seed(seed)
+    q = mx.random.normal((2, Hq, T, D)).astype(dt)
+    k = mx.random.normal((2, Hkv, T, D)).astype(dt)
+    v = mx.random.normal((2, Hkv, T, D)).astype(dt)
+    sc = D ** -0.5
+    sdpa = lambda *a, **kw: mx.fast.scaled_dot_product_attention(*a, scale=sc, **kw)
+    with bi.set_batch_invariant_mode(enabled=invariant):
+        full = sdpa(q, k, v, mask="causal")
+        part1 = sdpa(q[:, :, :T1], k[:, :, :T1], v[:, :, :T1], mask="causal")
+        part2 = sdpa(q[:, :, T1:], k, v, mask="causal")
+        chunked = mx.concatenate([part1, part2], axis=2)
+        dec = sdpa(q[:, :, T - 1 : T], k, v)  # decode step for the last token
+        mx.eval(full, chunked, dec)
+    return {
+        "chunked_prefill == full_prefill": bits(full) == bits(chunked),
+        "decode(last) == prefill(last)": bits(full[:, :, T - 1 : T]) == bits(dec),
+    }
 
 
 # ---- sweep ------------------------------------------------------------------
@@ -198,6 +250,16 @@ def main(argv=None) -> int:
                 r = sweep_one(op, a.batch_sizes, invariant, a.seed)
                 print(fmt(r), flush=True)
                 if invariant and not r.passed:
+                    any_inv_fail = True
+    print()
+    print("attention structure checks (chunked prefill, decode vs prefill):")
+    for dt_name in a.dtypes:
+        for invariant in (False, True):
+            r = attention_structure_checks(DTYPES[dt_name], invariant, a.seed)
+            mode = "INVARIANT" if invariant else "STOCK"
+            for name, ok in r.items():
+                print(f"{'sdpa':<12} {dt_name:<9} {mode:<10} {name}: {'pass' if ok else 'FAIL'}")
+                if invariant and not ok:
                     any_inv_fail = True
     print()
     if any_inv_fail:

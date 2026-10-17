@@ -11,10 +11,16 @@ share the launch. Concretely:
 
 from .matmul import batch_invariant_matmul
 from .rmsnorm import batch_invariant_rms_norm
-from .attention import batch_invariant_decode_attention
+from .attention import (
+    batch_invariant_attention,
+    batch_invariant_decode_attention,
+    batch_invariant_prefill_attention,
+)
 
 __all__ = [
     "batch_invariant_matmul",
     "batch_invariant_rms_norm",
     "batch_invariant_decode_attention",
+    "batch_invariant_prefill_attention",
+    "batch_invariant_attention",
 ]

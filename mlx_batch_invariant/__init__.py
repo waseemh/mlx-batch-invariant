@@ -9,7 +9,9 @@
 from ._mode import is_batch_invariant_mode_enabled, set_batch_invariant_mode
 from .ops import reset_stats, stats
 from .kernels import (
+    batch_invariant_attention,
     batch_invariant_decode_attention,
+    batch_invariant_prefill_attention,
     batch_invariant_matmul,
     batch_invariant_rms_norm,
 )
@@ -22,5 +24,7 @@ __all__ = [
     "batch_invariant_matmul",
     "batch_invariant_rms_norm",
     "batch_invariant_decode_attention",
+    "batch_invariant_prefill_attention",
+    "batch_invariant_attention",
 ]
 __version__ = "0.0.1"

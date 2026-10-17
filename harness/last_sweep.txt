@@ -27,5 +27,25 @@ sdpa_decode  bfloat16  STOCK      pass
 sdpa_decode  bfloat16  INVARIANT  pass
 sdpa_decode  float32   STOCK      pass
 sdpa_decode  float32   INVARIANT  pass
+sdpa_prefill float16   STOCK      pass
+sdpa_prefill float16   INVARIANT  pass
+sdpa_prefill bfloat16  STOCK      pass
+sdpa_prefill bfloat16  INVARIANT  pass
+sdpa_prefill float32   STOCK      pass
+sdpa_prefill float32   INVARIANT  pass
+
+attention structure checks (chunked prefill, decode vs prefill):
+sdpa         fp16      STOCK      chunked_prefill == full_prefill: pass
+sdpa         fp16      STOCK      decode(last) == prefill(last): FAIL
+sdpa         fp16      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         fp16      INVARIANT  decode(last) == prefill(last): pass
+sdpa         bf16      STOCK      chunked_prefill == full_prefill: pass
+sdpa         bf16      STOCK      decode(last) == prefill(last): pass
+sdpa         bf16      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         bf16      INVARIANT  decode(last) == prefill(last): pass
+sdpa         fp32      STOCK      chunked_prefill == full_prefill: pass
+sdpa         fp32      STOCK      decode(last) == prefill(last): FAIL
+sdpa         fp32      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         fp32      INVARIANT  decode(last) == prefill(last): pass
 
 INVARIANT mode: all probe rows bitwise identical across the sweep.
