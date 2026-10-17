@@ -245,7 +245,37 @@ GEMV can execute), traded against large-M speed, or a leaner MMA-GEMV.
 
 Before the performance pass the matmul kernels were 2.1–3.4x (dense) and
 2.3–6.8x (4-bit) slower than stock, and attention was 4–8x (decode) and
-48–58x (prefill). What moved the numbers, in order of
+48–58x (prefill).
+
+### What was tried for the two remaining gaps (and did not help)
+
+Both experiments are kept so nobody repeats them blind.
+
+*4-bit decode (M=1).* Staging a whole 256-wide K group per slab instead of
+32 (one memory round trip per group) was 2x *slower*: more threadgroup
+memory, fewer resident simdgroups, and 8x more A-staging work. A
+one-simdgroup 8-column tile with simdgroup-scope barriers, vectorized
+dequantization, half staging and dropping the extra graph ops each changed
+nothing measurable. Staging only the live A rows (now in) is neutral at
+M=1. The tile kernel's cost at these shapes is the slab loop itself; a
+GEMV cannot reproduce the MMA's per-element order (checked: no scalar
+summation order matches it bitwise), so closing this gap means choosing a
+different canonical order for the quantized op.
+
+*Prefill attention.* `kernels/attention_mma.py` is a full FlashAttention-
+style kernel on the simdgroup MMA: 8-query tiles, `S = Q·Kᵀ` and `P·V`
+through `simdgroup_multiply_accumulate`, row rescale in registers via the
+observed lane layout, decode as the same kernel with the query heads of a
+kv group filling the 8 rows. It is correct and bitwise invariant across
+batch, chunking and decode-vs-prefill (tests cover it), but slower than the
+lane-parallel kernel on every shape (decode 1.2–1.7x of stock, prefill
+4.3x), and 16- or 32-key blocks were slower still from register pressure.
+Two lessons are baked in: a block whose keys are all masked for a row must
+use `corr = 1` (otherwise `exp(-inf - -inf)` poisons the row, which only
+shows up when a tile straddles a 256-key split boundary, i.e. on
+*misaligned chunked prefill*, never on full prefill); and the per-row
+result of the MMA was row-position-independent in every check, so padding
+a decode query into an 8-row tile is sound. What moved the numbers, in order of
 effect: staging slabs in the input dtype with 4-wide vector loads and the
 mixed-precision MMA (about 2x at large M); 8-row tiles for M ≤ 32 (about 2x
 at decode); unpacking a whole uint32 per thread in the quantized path
@@ -271,11 +301,13 @@ bits across machines.
 2. ~~Run `model_sweep` on an unquantized checkpoint.~~ Done; clean.
 3. ~~`mx.quantized_matmul` (affine 4/8-bit).~~ Done; clean on a 4-bit model.
 4. ~~Performance (matmul, decode attention).~~ Done: 1.0–1.5x of stock.
-   Remaining: (a) 4-bit decode at M=1 is 2.3–3.5x stock GPU time (see
-   Results); (b) prefill attention is ~4x stock: the lane-parallel kernel
-   spends ~17 ops per (query, key) pair; an MMA-based QKᵀ/PV with 8-query
-   tiles would fix it but means a new canonical order that decode must
-   share (pad 1 query to 8, like the skinny matmul tile).
+   Remaining, with the dead ends above already explored: (a) 4-bit decode
+   at M=1, 2.3–3.5x stock GPU time, needs a GEMV-executable canonical order
+   for the quantized op (scalar fma in fixed chunks), paid for at large M;
+   (b) prefill attention ~4x: the MMA kernel in `attention_mma.py` needs
+   its per-block overhead (4 barriers, score round trip through threadgroup
+   memory per 8 keys) amortized without the register blow-up that larger
+   key blocks caused, e.g. two simdgroups per tile splitting D.
 5. **`mx.compile` interplay**: make sure graphs compiled inside the mode keep
    the invariant ops, or document that compilation must happen inside the
    `with` block.

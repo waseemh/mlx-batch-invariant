@@ -42,12 +42,12 @@ from __future__ import annotations
 import mlx.core as mx
 
 GROUP_K = 256      # fixed K chunk; never depends on M
-BK = 32            # staged K slab
 SPLIT_M_MAX = 32   # M <= this: skinny tiles + one K group per threadgroup
 
-# (BM, simdgroups along M, simdgroups along N, BN)
-TILE_FULL = (64, 2, 4, 64)    # 256 threads, 4x2 frags per simdgroup
-TILE_SKINNY = (8, 1, 4, 32)   # 128 threads, 1x1 frag per simdgroup; narrow so small-N decode gets enough tiles
+# (BM, simdgroups along M, simdgroups along N, BN, BK). BK is the staged K
+# slab: pure data movement, the MMA walks k in steps of 8 either way.
+TILE_FULL = (64, 2, 4, 64, 32)     # 256 threads, 4x2 frags per simdgroup
+TILE_SKINNY = (8, 1, 4, 32, 32)    # 128 threads, 1x1 frag per simdgroup; narrow so small-N decode gets enough tiles
 PAD = 4                   # extra floats per staged row, so fragment rows hit different banks
 
 UNROLL = "#pragma clang loop unroll(full)"
@@ -56,7 +56,8 @@ UNROLL = "#pragma clang loop unroll(full)"
 def cfg(tile, st_bytes=4):
     """Kernel-source parameters. ``st_bytes`` is the size of the staged
     element type (``ST``): 4 when slabs are staged as fp32, 2 for half/bfloat."""
-    BM, SGM, SGN, BN = tile
+    BM, SGM, SGN, BN, BK = tile
+    assert GROUP_K % BK == 0 and BK % 8 == 0
     threads = SGM * SGN * 32
     LD = BK + PAD  # both slabs are staged [row][k], k contiguous; LD % 4 == 0 keeps rows vector-aligned
     slab_floats = ((BM + BN) * LD * st_bytes + 3) // 4
@@ -116,21 +117,27 @@ _TILE_BODY = """
                 accg[i][j] = simdgroup_float8x8(0.0f);
         const int kg0 = g * @GROUP_K@;
         const int kg1 = metal::min(K, kg0 + @GROUP_K@);
+        // Rows of the A slab at or beyond M are zero. They are only touched here,
+        // once per group (the result staging aliases this memory at the fold),
+        // so a decode step stages one real row per slab instead of BM.
+        const int mrows = metal::min(@BM@, M - row0);
+        for (int e = lid; e < (@BM@ - mrows) * @LD@; e += @THREADS@)
+            As[mrows * @LD@ + e] = (@ST@)0;
         for (int k0 = kg0; k0 < kg1; k0 += @BK@) {
             if (veca) {
-                for (int e = lid; e < @BM@ * (@BK@ / 4); e += @THREADS@) {
+                for (int e = lid; e < mrows * (@BK@ / 4); e += @THREADS@) {
                     int i = e / (@BK@ / 4), k4 = e % (@BK@ / 4);
                     int m = row0 + i, k = k0 + k4 * 4;
-                    vec<@ST@, 4> v = (m < M && k < K)
+                    vec<@ST@, 4> v = (k < K)
                         ? vec<@ST@, 4>(*(const device vec<T, 4>*)(a + (size_t)m * a_sm + k))
                         : vec<@ST@, 4>(0);
                     *(threadgroup vec<@ST@, 4>*)(As + i * @LD@ + k4 * 4) = v;
                 }
             } else {
-                for (int e = lid; e < @BM@ * @BK@; e += @THREADS@) {
+                for (int e = lid; e < mrows * @BK@; e += @THREADS@) {
                     int i = e / @BK@, kk = e % @BK@;
                     int m = row0 + i, k = k0 + kk;
-                    As[i * @LD@ + kk] = (m < M && k < K) ? (@ST@)a[(size_t)m * a_sm + (size_t)k * a_sk] : (@ST@)0;
+                    As[i * @LD@ + kk] = (k < K) ? (@ST@)a[(size_t)m * a_sm + (size_t)k * a_sk] : (@ST@)0;
                 }
             }
 @STAGE_B@
