@@ -361,4 +361,6 @@ harness/               sweep.py (op-level), model_sweep.py (mlx_lm end-to-end)
 tests/                 pytest wrapper around the sweep + mode contract tests
 ```
 
-MIT.
+## License
+
+MIT. See [LICENSE](LICENSE).

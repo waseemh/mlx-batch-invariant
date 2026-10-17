@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Batch-invariant (deterministic) matmul, RMSNorm and decode-attention kernels for MLX on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 dependencies = ["mlx>=0.29", "numpy"]
 
 [project.optional-dependencies]
