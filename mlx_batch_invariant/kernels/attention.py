@@ -1,30 +1,34 @@
-"""Batch-invariant attention with a fixed KV split size.
+"""Batch-invariant attention with a fixed KV split size, lane-parallel.
 
-Why the split *size* is fixed and not the split *count*: attention must read
-the whole KV cache, so some parallelism along the KV axis is required. Stock
-kernels pick "n splits" from batch size and sequence length, which changes
-which keys get reduced together as the batch grows. We instead chunk the KV
-axis into blocks of exactly ``SPLIT_SIZE`` keys. Key ``j`` always lands in
-block ``j // SPLIT_SIZE`` at position ``j % SPLIT_SIZE``, and blocks are
-merged in index order. Growing the batch, or appending tokens to the cache,
-cannot change the reduction tree of an existing (batch, head, query) row.
+Canonical order per (batch, head, query):
 
-Three kernels sharing one inner loop (``_BLOCK_LOOP``) and one merge formula
-(``_MERGE``) so that **decode and prefill produce the same bits for the same
-query**:
+* keys are processed in fixed splits of ``SPLIT_SIZE`` (256) in index order;
+  key ``j`` always lands in split ``j // 256`` at the same position, so
+  neither batch size nor cache growth changes an existing row's reduction;
+* the score ``q.k`` is computed as 32 lane partials (lane ``l`` owns dims
+  ``[l*DL, (l+1)*DL)``, accumulated sequentially with fma) folded by a fixed
+  xor-butterfly tree and taken from lane 0;
+* inside a split, the online-softmax recurrence runs key by key:
+  ``m' = max(m, s); corr = exp(m - m'); p = exp(s - m'); l = fma(l, corr, p);
+  acc = fma(acc, corr, p * v)``, from exact zeros;
+* split partials ``(m, l, acc)`` are merged left to right with
+  ``c_old = exp(M - M'); c_new = exp(m - M'); L = fma(L, c_old, l * c_new);
+  A = fma(A, c_old, acc * c_new)``.
 
-* ``partial`` (decode): one thread per (batch*head, split). Online softmax
-  over that split's keys. Emits (m, l, acc[D]).
-* ``combine`` (decode): one thread per (batch*head, d). Merges splits in order.
-* ``prefill``: one thread per (batch*head, query). Runs the same per-split
-  loop and the same merge, sequentially, for the keys that query may see.
-  No partial buffer, so memory is O(B*H*T*D) regardless of KV length.
+Two kernels execute that sequence; they differ only in what shares a K/V
+row load:
 
-Causal convention matches ``mx.fast.scaled_dot_product_attention``: with a
-KV cache of length L and T queries, query i attends keys 0..L-T+i.
+* ``decode`` (T_q == 1): one simdgroup per (batch, kv head, head chunk,
+  split). The ``G`` query heads of a kv head share each K/V row. Emits
+  (m, l, acc) per (query head, split); ``combine`` folds the splits.
+* ``prefill``: one simdgroup per (batch, head, block of ``QB`` queries); the
+  queries share each K/V row and the split fold happens in registers.
+  Causal masking is per query inside the key loop, which is bitwise the
+  same as stopping the loop early (an empty or short split merges as a
+  no-op).
 
-Supported: ``mask`` is ``None`` or ``"causal"``, no attention sinks, GQA/MQA
-via integer head ratio. Array masks fall back to the stock kernel (counted).
+Supported: ``mask`` None or ``"causal"``, no sinks, D % 32 == 0, GQA/MQA via
+integer head ratio. Array masks fall back to stock (counted).
 """
 
 from __future__ import annotations
@@ -32,72 +36,117 @@ from __future__ import annotations
 import mlx.core as mx
 
 SPLIT_SIZE = 256
+QB = 4          # queries per prefill simdgroup
+MAX_G = 8       # query heads per decode simdgroup
+MIN_UNITS = 256 # below this many simdgroups, stop sharing K/V across heads to get parallelism
+UNITS_PER_TG = 4
 
-# Online softmax over keys [j0, j1) of one (b, hk) stream into (m, l, acc).
-# Identical text in every kernel => identical instruction sequence.
-_BLOCK_LOOP = """
-        float m = -INFINITY;
-        float l = 0.0f;
-        float acc[D];
-        for (int d = 0; d < D; ++d) acc[d] = 0.0f;
-        for (int j = j0; j < j1; ++j) {
-            const device T* kr = kb + (size_t)j * D;
-            float s = 0.0f;
-            for (int d = 0; d < D; ++d) s = fma(qreg[d], (float)kr[d], s);
-            float m_new = metal::max(m, s);
-            float corr  = metal::exp(m - m_new);
-            float p     = metal::exp(s - m_new);
-            l = fma(l, corr, p);
-            const device T* vr = vb + (size_t)j * D;
-            for (int d = 0; d < D; ++d) acc[d] = fma(acc[d], corr, p * (float)vr[d]);
-            m = m_new;
-        }
+# ---- shared per-key update: identical text in decode and prefill --------------
+# Expects: kr/vr (device row pointers), qreg[NQ][DL], m[NQ], l[NQ], acc[NQ][DL],
+# and a predicate `active(iq)` deciding whether query iq sees this key.
+_KEY_UPDATE = """
+            float kreg[DL];
+            float vreg[DL];
+            @UNROLL@
+            for (int d = 0; d < DL; ++d) kreg[d] = (float)kr[lane * DL + d];
+            @UNROLL@
+            for (int d = 0; d < DL; ++d) vreg[d] = (float)vr[lane * DL + d];
+            @UNROLL@
+            for (int iq = 0; iq < NQ; ++iq) {
+                float part = 0.0f;
+                @UNROLL@
+                for (int d = 0; d < DL; ++d) part = fma(qreg[iq][d], kreg[d], part);
+                part += simd_shuffle_xor(part, 16);
+                part += simd_shuffle_xor(part, 8);
+                part += simd_shuffle_xor(part, 4);
+                part += simd_shuffle_xor(part, 2);
+                part += simd_shuffle_xor(part, 1);
+                const float s = simd_shuffle(part, 0);
+                if (ACTIVE(iq)) {
+                    float m_new = metal::max(m[iq], s);
+                    float corr  = metal::exp(m[iq] - m_new);
+                    float p     = metal::exp(s - m_new);
+                    l[iq] = fma(l[iq], corr, p);
+                    @UNROLL@
+                    for (int d = 0; d < DL; ++d) acc[iq][d] = fma(acc[iq][d], corr, p * vreg[d]);
+                    m[iq] = m_new;
+                }
+            }
 """
 
-# Merge a split's (m, l, acc) into the running (M, Ls, A). Scalar form is used
-# by the decode combine kernel (one d per thread); vector form by prefill.
-_MERGE_SCALARS = """
-            float m_new = metal::max(M, m);
-            float c_old = metal::exp(M - m_new);
-            float c_new = metal::exp(m - m_new);
-            Ls = fma(Ls, c_old, l * c_new);
+_MERGE = """
+                float M_new = metal::max(M[iq], m[iq]);
+                float c_old = metal::exp(M[iq] - M_new);
+                float c_new = metal::exp(m[iq] - M_new);
+                Ls[iq] = fma(Ls[iq], c_old, l[iq] * c_new);
+                @UNROLL@
+                for (int d = 0; d < DL; ++d) A[iq][d] = fma(A[iq][d], c_old, acc[iq][d] * c_new);
+                M[iq] = M_new;
 """
 
-_PARTIAL_SRC = f"""
-    const int BH      = q_shape[0];        // B * Hq
-    const int Hq      = hp[0];
-    const int Hkv     = hp[1];
-    const int L       = k_shape[2];
-    const int nsplit  = hp[2];
+_DECODE_SRC = """
+    #define NQ GU
+    #define ACTIVE(iq) ((iq) < gcount)
+    const int Hq     = hp[0];
+    const int Hkv    = hp[1];
+    const int nsplit = hp[2];
+    const int nchunk = hp[3];          // head chunks per kv head
+    const int L      = k_shape[2];
     const float scale = scl[0];
+    const int G = Hq / Hkv;
 
-    const int gid = thread_position_in_grid.x;
-    if (gid >= BH * nsplit) return;
-    const int bh    = gid / nsplit;
-    const int split = gid % nsplit;
-    const int b     = bh / Hq;
-    const int h     = bh % Hq;
-    const int hk    = h / (Hq / Hkv);
+    const int unit = thread_position_in_grid.x / 32;
+    const int lane = thread_index_in_simdgroup;
+    const int units = k_shape[0] * Hkv * nchunk * nsplit;
+    if (unit >= units) return;
+    int u = unit;
+    const int split = u % nsplit; u /= nsplit;
+    const int chunk = u % nchunk; u /= nchunk;
+    const int hk    = u % Hkv;    u /= Hkv;
+    const int b     = u;
+    const int h0 = hk * G + chunk * GU;
+    const int gcount = metal::min(GU, G - chunk * GU);
 
-    const device T* qr = q + (size_t)bh * D;
     const device T* kb = k + ((size_t)b * Hkv + hk) * (size_t)L * D;
     const device T* vb = v + ((size_t)b * Hkv + hk) * (size_t)L * D;
 
-    float qreg[D];
-    for (int d = 0; d < D; ++d) qreg[d] = (float)qr[d] * scale;
+    float qreg[GU][DL];
+    @UNROLL@
+    for (int iq = 0; iq < GU; ++iq) {
+        const device T* qr = q + ((size_t)b * Hq + h0 + metal::min(iq, gcount - 1)) * D;
+        @UNROLL@
+        for (int d = 0; d < DL; ++d) qreg[iq][d] = (float)qr[lane * DL + d] * scale;
+    }
+    float m[GU], l[GU], acc[GU][DL];
+    @UNROLL@
+    for (int iq = 0; iq < GU; ++iq) {
+        m[iq] = -INFINITY; l[iq] = 0.0f;
+        @UNROLL@
+        for (int d = 0; d < DL; ++d) acc[iq][d] = 0.0f;
+    }
 
     const int j0 = split * SPLIT;
     const int j1 = metal::min(L, j0 + SPLIT);
-    {{
-{_BLOCK_LOOP}
-        const size_t po = ((size_t)bh * nsplit + split);
-        pm[po] = m;
-        pl[po] = l;
-        for (int d = 0; d < D; ++d) pacc[po * D + d] = acc[d];
-    }}
+    for (int j = j0; j < j1; ++j) {
+        const device T* kr = kb + (size_t)j * D;
+        const device T* vr = vb + (size_t)j * D;
+@KEY_UPDATE@
+    }
+
+    @UNROLL@
+    for (int iq = 0; iq < GU; ++iq) {
+        if (iq < gcount) {
+            const size_t po = ((size_t)b * Hq + h0 + iq) * nsplit + split;
+            if (lane == 0) { pm[po] = m[iq]; pl[po] = l[iq]; }
+            @UNROLL@
+            for (int d = 0; d < DL; ++d) pacc[po * D + lane * DL + d] = acc[iq][d];
+        }
+    }
+    #undef NQ
+    #undef ACTIVE
 """
 
-_COMBINE_SRC = f"""
+_COMBINE_SRC = """
     const int BH     = pm_shape[0];
     const int nsplit = pm_shape[1];
     const int gid = thread_position_in_grid.x;
@@ -106,74 +155,131 @@ _COMBINE_SRC = f"""
     const int d  = gid % D;
 
     float M = -INFINITY, Ls = 0.0f, A = 0.0f;
-    for (int i = 0; i < nsplit; ++i) {{
+    for (int i = 0; i < nsplit; ++i) {
         const size_t po = (size_t)bh * nsplit + i;
         const float m = pm[po];
         const float l = pl[po];
-        {{
-{_MERGE_SCALARS}
-            A = fma(A, c_old, pacc[po * D + d] * c_new);
-            M = m_new;
-        }}
-    }}
+        const float acc = pacc[po * D + d];
+        float M_new = metal::max(M, m);
+        float c_old = metal::exp(M - M_new);
+        float c_new = metal::exp(m - M_new);
+        Ls = fma(Ls, c_old, l * c_new);
+        A = fma(A, c_old, acc * c_new);
+        M = M_new;
+    }
     out[(size_t)bh * D + d] = (T)(A / Ls);
 """
 
-_PREFILL_SRC = f"""
-    const int Hq      = hp[0];
-    const int Hkv     = hp[1];
-    const int Tq      = hp[2];
-    const int causal  = hp[3];
-    const int L       = k_shape[2];
+_PREFILL_SRC = """
+    #define NQ QB
+    #define ACTIVE(iq) (j < nkeys[iq])
+    const int Hq     = hp[0];
+    const int Hkv    = hp[1];
+    const int Tq     = hp[2];
+    const int causal = hp[3];
+    const int L      = k_shape[2];
     const float scale = scl[0];
-    const int BHT = q_shape[0];            // B * Hq * Tq
+    const int nblk = (Tq + QB - 1) / QB;
 
-    const int gid = thread_position_in_grid.x;
-    if (gid >= BHT) return;
-    const int qi = gid % Tq;
-    const int bh = gid / Tq;
-    const int b  = bh / Hq;
-    const int h  = bh % Hq;
-    const int hk = h / (Hq / Hkv);
+    const int unit = thread_position_in_grid.x / 32;
+    const int lane = thread_index_in_simdgroup;
+    const int units = k_shape[0] * Hq * nblk;
+    if (unit >= units) return;
+    int u = unit;
+    const int blk = u % nblk; u /= nblk;
+    const int h   = u % Hq;   u /= Hq;
+    const int b   = u;
+    const int hk  = h / (Hq / Hkv);
+    const int q0  = blk * QB;
 
-    const device T* qr = q + (size_t)gid * D;
     const device T* kb = k + ((size_t)b * Hkv + hk) * (size_t)L * D;
     const device T* vb = v + ((size_t)b * Hkv + hk) * (size_t)L * D;
 
-    float qreg[D];
-    for (int d = 0; d < D; ++d) qreg[d] = (float)qr[d] * scale;
+    int nkeys[QB];
+    float qreg[QB][DL];
+    @UNROLL@
+    for (int iq = 0; iq < QB; ++iq) {
+        const int qi = metal::min(q0 + iq, Tq - 1);
+        nkeys[iq] = (q0 + iq < Tq) ? (causal ? (L - Tq + qi + 1) : L) : 0;
+        const device T* qr = q + (((size_t)b * Hq + h) * Tq + qi) * D;
+        @UNROLL@
+        for (int d = 0; d < DL; ++d) qreg[iq][d] = (float)qr[lane * DL + d] * scale;
+    }
+    int nkeys_max = 0;
+    @UNROLL@
+    for (int iq = 0; iq < QB; ++iq) nkeys_max = metal::max(nkeys_max, nkeys[iq]);
+    const int nsplit = (nkeys_max + SPLIT - 1) / SPLIT;
 
-    const int nkeys  = causal ? (L - Tq + qi + 1) : L;
-    const int nsplit = (nkeys + SPLIT - 1) / SPLIT;
+    float M[QB], Ls[QB], A[QB][DL];
+    float m[QB], l[QB], acc[QB][DL];
+    @UNROLL@
+    for (int iq = 0; iq < QB; ++iq) {
+        M[iq] = -INFINITY; Ls[iq] = 0.0f;
+        @UNROLL@
+        for (int d = 0; d < DL; ++d) A[iq][d] = 0.0f;
+    }
 
-    float M = -INFINITY, Ls = 0.0f;
-    float A[D];
-    for (int d = 0; d < D; ++d) A[d] = 0.0f;
-
-    for (int split = 0; split < nsplit; ++split) {{
+    for (int split = 0; split < nsplit; ++split) {
+        @UNROLL@
+        for (int iq = 0; iq < QB; ++iq) {
+            m[iq] = -INFINITY; l[iq] = 0.0f;
+            @UNROLL@
+            for (int d = 0; d < DL; ++d) acc[iq][d] = 0.0f;
+        }
         const int j0 = split * SPLIT;
-        const int j1 = metal::min(nkeys, j0 + SPLIT);
-{_BLOCK_LOOP}
-        {{
-{_MERGE_SCALARS}
-            for (int d = 0; d < D; ++d) A[d] = fma(A[d], c_old, acc[d] * c_new);
-            M = m_new;
-        }}
-    }}
-    for (int d = 0; d < D; ++d) out[(size_t)gid * D + d] = (T)(A[d] / Ls);
+        const int j1 = metal::min(nkeys_max, j0 + SPLIT);
+        for (int j = j0; j < j1; ++j) {
+            const device T* kr = kb + (size_t)j * D;
+            const device T* vr = vb + (size_t)j * D;
+@KEY_UPDATE@
+        }
+        @UNROLL@
+        for (int iq = 0; iq < QB; ++iq) {
+            if (j0 < nkeys[iq]) {   // split touched this query; otherwise the merge is a no-op
+@MERGE@
+            }
+        }
+    }
+
+    @UNROLL@
+    for (int iq = 0; iq < QB; ++iq) {
+        if (q0 + iq < Tq) {
+            const size_t o = (((size_t)b * Hq + h) * Tq + q0 + iq) * D;
+            @UNROLL@
+            for (int d = 0; d < DL; ++d) out[o + lane * DL + d] = (T)(A[iq][d] / Ls[iq]);
+        }
+    }
+    #undef NQ
+    #undef ACTIVE
 """
 
-_partial = _combine = _prefill = None
+UNROLL = "#pragma clang loop unroll(full)"
+
+
+def _src(s: str) -> str:
+    return s.replace("@KEY_UPDATE@", _KEY_UPDATE).replace("@MERGE@", _MERGE).replace("@UNROLL@", UNROLL)
+
+
+_decode = _combine = _prefill = None
+_params: dict = {}
+
+
+def _param(vals, dtype):
+    """Small constant arrays, cached so a decode step does not re-upload them per layer."""
+    key = (tuple(vals), dtype)
+    if key not in _params:
+        _params[key] = mx.array(list(vals), dtype=dtype)
+    return _params[key]
 
 
 def _kernels():
-    global _partial, _combine, _prefill
-    if _partial is None:
-        _partial = mx.fast.metal_kernel(
-            name="bi_attn_partial",
+    global _decode, _combine, _prefill
+    if _decode is None:
+        _decode = mx.fast.metal_kernel(
+            name="bi_attn_decode",
             input_names=["q", "k", "v", "hp", "scl"],
             output_names=["pm", "pl", "pacc"],
-            source=_PARTIAL_SRC,
+            source=_src(_DECODE_SRC),
         )
         _combine = mx.fast.metal_kernel(
             name="bi_attn_combine",
@@ -185,9 +291,9 @@ def _kernels():
             name="bi_attn_prefill",
             input_names=["q", "k", "v", "hp", "scl"],
             output_names=["out"],
-            source=_PREFILL_SRC,
+            source=_src(_PREFILL_SRC),
         )
-    return _partial, _combine, _prefill
+    return _decode, _combine, _prefill
 
 
 def supports(q: mx.array, k: mx.array, v: mx.array, mask, sinks) -> bool:
@@ -198,6 +304,7 @@ def supports(q: mx.array, k: mx.array, v: mx.array, mask, sinks) -> bool:
         and q.shape[1] % k.shape[1] == 0
         and k.shape == v.shape
         and q.shape[-1] == k.shape[-1]
+        and q.shape[-1] % 32 == 0
         and q.shape[0] == k.shape[0]
         and (mask is None or q.shape[2] <= k.shape[2])
     )
@@ -212,27 +319,37 @@ def _prep(q, k, v):
     return dt, k, v
 
 
+def _tg(units: int):
+    return (min(units, UNITS_PER_TG) * 32, 1, 1)
+
+
 def batch_invariant_decode_attention(
     q: mx.array, k: mx.array, v: mx.array, *, scale: float, split_size: int = SPLIT_SIZE
 ) -> mx.array:
-    """T_q == 1. Two launches: per-split partials, then an ordered combine."""
+    """T_q == 1. Per-split partials (G heads share K/V rows), then an ordered combine."""
     B, Hq, Tq, D = q.shape
     _, Hkv, L, _ = k.shape
-    assert Tq == 1
+    assert Tq == 1 and D % 32 == 0
     dt, k, v = _prep(q, k, v)
+    G = Hq // Hkv
     nsplit = (L + split_size - 1) // split_size
+    # Heads per unit: share K/V rows across the group when there is enough work
+    # to fill the GPU anyway; otherwise give every head its own unit. The
+    # per-head arithmetic is identical either way.
+    GU = min(G, MAX_G)
+    if B * Hkv * nsplit * ((G + GU - 1) // GU) < MIN_UNITS:
+        GU = 1
+    nchunk = (G + GU - 1) // GU
     BH = B * Hq
-    q2 = q.reshape(BH, D)
-    hp = mx.array([Hq, Hkv, nsplit], dtype=mx.int32)
-    scl = mx.array([scale], dtype=mx.float32)
-    partial, combine, _ = _kernels()
-
-    n = BH * nsplit
-    pm, pl, pacc = partial(
-        inputs=[q2, k, v, hp, scl],
-        template=[("T", dt), ("D", D), ("SPLIT", split_size)],
-        grid=(n, 1, 1),
-        threadgroup=(min(n, 64), 1, 1),
+    units = B * Hkv * nchunk * nsplit
+    hp = _param([Hq, Hkv, nsplit, nchunk], mx.int32)
+    scl = _param([float(scale)], mx.float32)
+    decode, combine, _ = _kernels()
+    pm, pl, pacc = decode(
+        inputs=[q.reshape(BH, D), k, v, hp, scl],
+        template=[("T", dt), ("D", D), ("DL", D // 32), ("GU", GU), ("SPLIT", split_size)],
+        grid=(units * 32, 1, 1),
+        threadgroup=_tg(units),
         output_shapes=[(BH, nsplit), (BH, nsplit), (BH, nsplit, D)],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
@@ -252,24 +369,25 @@ def batch_invariant_prefill_attention(
     q: mx.array, k: mx.array, v: mx.array, *, scale: float, causal: bool,
     split_size: int = SPLIT_SIZE,
 ) -> mx.array:
-    """Any T_q. One thread per query row, same split loop + merge as decode."""
+    """Any T_q. One simdgroup per block of QB queries; same split loop and merge as decode."""
     B, Hq, Tq, D = q.shape
     _, Hkv, L, _ = k.shape
+    assert D % 32 == 0
     dt, k, v = _prep(q, k, v)
-    BHT = B * Hq * Tq
-    q2 = q.reshape(BHT, D)
-    hp = mx.array([Hq, Hkv, Tq, 1 if causal else 0], dtype=mx.int32)
-    scl = mx.array([scale], dtype=mx.float32)
+    nblk = (Tq + QB - 1) // QB
+    units = B * Hq * nblk
+    hp = _param([Hq, Hkv, Tq, 1 if causal else 0], mx.int32)
+    scl = _param([float(scale)], mx.float32)
     _, _, prefill = _kernels()
     out = prefill(
-        inputs=[q2, k, v, hp, scl],
-        template=[("T", dt), ("D", D), ("SPLIT", split_size)],
-        grid=(BHT, 1, 1),
-        threadgroup=(min(BHT, 64), 1, 1),
-        output_shapes=[(BHT, D)],
+        inputs=[q, k, v, hp, scl],
+        template=[("T", dt), ("D", D), ("DL", D // 32), ("QB", QB), ("SPLIT", split_size)],
+        grid=(units * 32, 1, 1),
+        threadgroup=_tg(units),
+        output_shapes=[(B, Hq, Tq, D)],
         output_dtypes=[dt],
     )[0]
-    return out.reshape(B, Hq, Tq, D)
+    return out
 
 
 def batch_invariant_attention(q, k, v, *, scale: float, mask=None) -> mx.array:

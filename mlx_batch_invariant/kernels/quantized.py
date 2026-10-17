@@ -8,9 +8,13 @@ low-to-high inside uint32 words (``32 // bits`` codes per word), with one
 
 This reuses the dense tile body from ``matmul.py`` (same K groups, same slab
 order, same MMA sequence, same fold, same launch shapes), with one change:
-the B slab is dequantized in fp32 while it is staged. Each thread unpacks a
-whole uint32 word, so the global reads are coalesced word loads and the
-threadgroup stores are k-contiguous.
+the B slab is dequantized while it is staged. Each thread unpacks a whole
+uint32 word, so the global reads are coalesced word loads and the
+threadgroup stores are k-contiguous vector stores. Codes are converted four
+at a time and dequantized with an fp32 vector fma against the stored scale
+and bias, then rounded once into the staged dtype. For 16-bit
+inputs the staged dtype is T and the half/bfloat MMA is used; fp32 inputs
+stage fp32.
 
 Stock ``mx.quantized_matmul`` differs between batch 1 and batch 2 on the same
 row (measured 0.125 abs in fp16 at K=N=4096, 4-bit, group 64); this kernel
@@ -42,18 +46,22 @@ _STAGE_B_QUANT = """
                 int j = e / WPS, wi = e % WPS;
                 int n = col0 + j;
                 int kbase = k0 + wi * PER_WORD;
-                threadgroup float* dst = Bs + j * @LD@ + wi * PER_WORD;
+                threadgroup vec<@ST@, 4>* dst = (threadgroup vec<@ST@, 4>*)(Bs + j * @LD@ + wi * PER_WORD);
                 if (n < N && kbase < K) {
                     uint word = w[(size_t)n * words_per_row + (size_t)(kbase / PER_WORD)];
                     int g = kbase / GS;
-                    float s = (float)scales[(size_t)n * groups_per_row + g];
-                    float bia = (float)biases[(size_t)n * groups_per_row + g];
+                    // Dequantize four codes at a time: fp32 vector fma against the
+                    // stored scale and bias, then one rounding into the staged dtype.
+                    const float4 s4 = float4((float)scales[(size_t)n * groups_per_row + g]);
+                    const float4 b4 = float4((float)biases[(size_t)n * groups_per_row + g]);
                     @UNROLL@
-                    for (int q = 0; q < PER_WORD; ++q)
-                        dst[q] = fma((float)((word >> (BITS * q)) & MASK), s, bia);
+                    for (int q4 = 0; q4 < PER_WORD / 4; ++q4) {
+                        uint4 c = (uint4(word) >> (uint4(0, 1, 2, 3) * BITS + uint4(q4 * 4 * BITS))) & uint4(MASK);
+                        dst[q4] = vec<@ST@, 4>(fma(float4(c), s4, b4));
+                    }
                 } else {
                     @UNROLL@
-                    for (int q = 0; q < PER_WORD; ++q) dst[q] = 0.0f;
+                    for (int q4 = 0; q4 < PER_WORD / 4; ++q4) dst[q4] = vec<@ST@, 4>(0);
                 }
             }
 """
@@ -61,18 +69,23 @@ _STAGE_B_QUANT = """
 _kernels: dict = {}
 
 
-def _get_kernel(tile):
-    if tile not in _kernels:
-        c = dict(_mm.cfg(tile, 4), UNROLL=_mm.UNROLL, ST="float")
+def _get_kernel(tile, nbytes):
+    """Kernel for a tile config and input element size. 16-bit inputs stage the
+    dequantized weight as T (what stock does) and use the half/bfloat MMA;
+    fp32 inputs stage fp32."""
+    key = (tile, nbytes)
+    if key not in _kernels:
+        st = "T" if nbytes == 2 else "float"
+        c = dict(_mm.cfg(tile, nbytes), UNROLL=_mm.UNROLL, ST=st)
         head = _mm._fill(_QUANT_HEAD, c)
-        _kernels[tile] = mx.fast.metal_kernel(
-            name=f"bi_quantized_matmul_bm{tile[0]}",
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"bi_quantized_matmul_bm{tile[0]}_s{nbytes}",
             input_names=["a", "w", "scales", "biases"],
             output_names=["out"],
-            source=_mm.tile_source(head, _mm._fill(_STAGE_B_QUANT, c), tile, st="float", st_bytes=4),
-            ensure_row_contiguous=False,
+            source=_mm.tile_source(head, _mm._fill(_STAGE_B_QUANT, c), tile, st=st, st_bytes=nbytes),
+            ensure_row_contiguous=True,   # MLX copies a non-contiguous operand itself; no graph ops on our side
         )
-    return _kernels[tile]
+    return _kernels[key]
 
 
 def supports(x, w, scales, biases, transpose, group_size, bits, mode) -> bool:
@@ -100,11 +113,13 @@ def batch_invariant_quantized_matmul(
     x2 = x.reshape(-1, K) if x.ndim != 2 else x
     M = x2.shape[0]
     dt = x.dtype
-    w = mx.contiguous(w)
-    scales = mx.contiguous(scales.astype(dt) if scales.dtype != dt else scales)
-    biases = mx.contiguous(biases.astype(dt) if biases.dtype != dt else biases)
+    if scales.dtype != dt:
+        scales = scales.astype(dt)
+    if biases.dtype != dt:
+        biases = biases.astype(dt)
+    nbytes = dt.size
     out = _mm.launch_tiled(
-        _get_kernel, [x2, w, scales, biases], [("T", dt), ("BITS", bits), ("GS", group_size)],
-        M, N, K, dt,
+        lambda tile: _get_kernel(tile, nbytes), [x2, w, scales, biases],
+        [("T", dt), ("BITS", bits), ("GS", group_size)], M, N, K, dt,
     )
     return out.reshape(*lead, N)

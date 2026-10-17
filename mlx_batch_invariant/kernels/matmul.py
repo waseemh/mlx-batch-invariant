@@ -42,12 +42,12 @@ from __future__ import annotations
 import mlx.core as mx
 
 GROUP_K = 256      # fixed K chunk; never depends on M
-BN = 64            # tile width
 BK = 32            # staged K slab
 SPLIT_M_MAX = 32   # M <= this: skinny tiles + one K group per threadgroup
 
-TILE_FULL = (64, 2, 4)    # (BM, simdgroups along M, along N): 256 threads, 4x2 frags each
-TILE_SKINNY = (8, 1, 4)   # 128 threads, 1x2 frags each
+# (BM, simdgroups along M, simdgroups along N, BN)
+TILE_FULL = (64, 2, 4, 64)    # 256 threads, 4x2 frags per simdgroup
+TILE_SKINNY = (8, 1, 4, 32)   # 128 threads, 1x1 frag per simdgroup; narrow so small-N decode gets enough tiles
 PAD = 4                   # extra floats per staged row, so fragment rows hit different banks
 
 UNROLL = "#pragma clang loop unroll(full)"
@@ -56,7 +56,7 @@ UNROLL = "#pragma clang loop unroll(full)"
 def cfg(tile, st_bytes=4):
     """Kernel-source parameters. ``st_bytes`` is the size of the staged
     element type (``ST``): 4 when slabs are staged as fp32, 2 for half/bfloat."""
-    BM, SGM, SGN = tile
+    BM, SGM, SGN, BN = tile
     threads = SGM * SGN * 32
     LD = BK + PAD  # both slabs are staged [row][k], k contiguous; LD % 4 == 0 keeps rows vector-aligned
     slab_floats = ((BM + BN) * LD * st_bytes + 3) // 4
@@ -134,7 +134,7 @@ _TILE_BODY = """
                 }
             }
 @STAGE_B@
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            @BARRIER@;
 
             @UNROLL@
             for (int kk = 0; kk < @BK@; kk += 8) {
@@ -152,7 +152,7 @@ _TILE_BODY = """
                     for (int j = 0; j < @FN@; ++j)
                         simdgroup_multiply_accumulate(accg[i][j], af[i], bf[j], accg[i][j]);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            @BARRIER@;
         }
         // Stage the group partial and fold it with a plain fp32 add: the exact
         // same operation the split-mode combine kernel performs.
@@ -161,11 +161,11 @@ _TILE_BODY = """
             @UNROLL@
             for (int j = 0; j < @FN@; ++j)
                 simdgroup_store(accg[i][j], Cs + (sg_m * @FM@ * 8 + i * 8) * @BN@ + sg_n * @FN@ * 8 + j * 8, @BN@);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        @BARRIER@;
         @UNROLL@
         for (int t = 0; t < @PER_THREAD@; ++t)
             total[t] = total[t] + Cs[lid + t * @THREADS@];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        @BARRIER@;
     }
 
     @UNROLL@
@@ -230,6 +230,9 @@ def tile_source(head: str, stage_b: str, tile, st: str = "float", st_bytes: int 
     with fp32 accumulate) or "float" (fp32 MMA). ``st_bytes`` is its size,
     which sizes the shared memory."""
     c = dict(cfg(tile, st_bytes), UNROLL=UNROLL, ST=st)
+    # A one-simdgroup tile only needs simdgroup-scope synchronization.
+    c["BARRIER"] = ("simdgroup_barrier(mem_flags::mem_threadgroup)" if c["THREADS"] == 32
+                    else "threadgroup_barrier(mem_flags::mem_threadgroup)")
     body = _TILE_BODY.replace("@STAGE_B@", stage_b)
     return head + _fill(body, c)
 
@@ -271,6 +274,7 @@ def launch_tiled(get_kernel, inputs, template, M, N, K, out_dtype):
     tile = TILE_SKINNY if skinny else TILE_FULL
     c = cfg(tile)
     kernel = get_kernel(tile)
+    BN = c["BN"]
     grid_xy = ((N + BN - 1) // BN * c["THREADS"], (M + c["BM"] - 1) // c["BM"])
     tg = (c["THREADS"], 1, 1)
     if not (skinny and ngroups > 1):

@@ -16,8 +16,9 @@ and batch 256.
 Status: **works end to end on `mlx_lm` models, unquantized and 4-bit**
 (Qwen2.5-0.5B bf16 and its 4-bit affine quantization): bitwise-identical
 logits at batch 1, 4, 16 and 64, in prefill and in cached decode, with no
-fallbacks. Matmul kernels run within 1.0–1.4x of stock MLX. See *Results*
-and *Roadmap*.
+fallbacks. Matmul and decode attention run within 1.0–1.5x of stock MLX;
+prefill attention is ~4x off; end-to-end generation on a 0.5B model is 1.2x
+slower (bf16) and 2.1x slower (4-bit). See *Results* and *Roadmap*.
 
 ## Install
 
@@ -87,23 +88,28 @@ Not patched: batched 3-D matmul, mxfp4/mxfp8/nvfp4 quantization modes, and
 - **rms_norm** (`kernels/rmsnorm.py`): one 256-thread threadgroup per row,
   fixed-stride partial sums, fixed-shape tree reduction.
 - **attention** (`kernels/attention.py`): fixed split **size** along KV
-  (256 keys), not fixed split count. Key `j` always lands in split `j // 256`
-  at the same position, and splits are merged in index order, so neither
-  batch size nor cache growth changes an existing row's reduction. Decode
-  (`T_q == 1`) runs as per-split partials plus an ordered combine; prefill
-  runs one thread per query doing the *same* split loop and merge
-  sequentially. The inner loop and merge are literally the same source text
-  in all three kernels, which is what makes a token's attention output
-  bitwise identical whether it came from prefill or from a later decode
-  step. Causal masking follows MLX's convention (query `i` of `T` against a
-  cache of `L` sees keys `0..L-T+i`).
+  (256 keys), not fixed split count, so neither batch size nor cache growth
+  changes an existing row's reduction. Lane-parallel: one simdgroup per
+  unit, each lane owns `D/32` head dims; the score `q·k` is 32 lane partials
+  folded by a fixed xor-butterfly tree and taken from lane 0; the online
+  softmax then runs key by key and splits merge left to right. Decode units
+  are (batch, kv head, head chunk, split) and the grouped query heads share
+  each K/V row load (or, when there is too little work to fill the GPU, one
+  head per unit); prefill units are (batch, head, block of 4 queries) with
+  causal masking applied per query inside the key loop. The per-key update
+  and the merge are the same source text in both kernels, which is what
+  makes a token's attention output bitwise identical from prefill and from
+  a later decode step. Causal convention matches MLX (query `i` of `T`
+  against a cache of `L` sees keys `0..L-T+i`).
 
 ## Harness
 
 ```bash
 .venv/bin/python -m harness.sweep --strict          # op-level batch sweep, bitwise
 .venv/bin/python -m pytest -q tests                 # same, as a test suite
-.venv/bin/python -m harness.model_sweep --model <unquantized mlx-community repo> [--decode]
+.venv/bin/python -m harness.model_sweep --model <mlx_lm model> [--decode]
+.venv/bin/python -m harness.bench [--attention]     # kernel timings, stock vs invariant
+.venv/bin/python -m harness.generate_bench --model <mlx_lm model>   # tokens/s, reproducibility
 ```
 
 `harness.sweep` embeds a fixed probe row in batches of 1…256 at row 0 and at
@@ -185,8 +191,39 @@ result above showing up at the first linear layer.
 | 64  | 0.99        | 1.26 (1.3x)     | 0.98        | 1.24 (1.3x)     |
 | 512 | 5.00        | 6.48 (1.3x)     | 5.36        | 6.69 (1.2x)     |
 
-Before the performance pass the same kernels were 2.1–3.4x (dense) and
-2.3–6.8x (4-bit) slower than stock. What moved the numbers, in order of
+Attention (Hq=32, Hkv=8, D=128, fp16, `python -m harness.bench --attention`):
+
+| decode B × KV len | stock | invariant |   | prefill T (causal) | stock | invariant |
+|---|---|---|---|---|---|---|
+| 1 × 1k   | 0.29  | 0.46 (1.6x) |   | 128  | 0.40  | 0.63 (1.5x)   |
+| 1 × 32k  | 1.63  | 1.69 (1.0x) |   | 1024 | 3.20  | 12.44 (3.9x)  |
+| 8 × 8k   | 3.08  | 3.08 (1.0x) |   | 4096 | 42.68 | 186.84 (4.4x) |
+| 64 × 4k  | 12.61 | 11.70 (0.9x) |  |      |       |               |
+
+End to end (`python -m harness.generate_bench`, Qwen2.5-0.5B, 36-token
+prompt, 200 greedy tokens; each mode reproduces its own completion run to
+run, no fallbacks):
+
+| model | mode | prompt tok/s | generation tok/s |
+|---|---|---|---|
+| bf16  | stock     | 1093 | 95.4  |
+| bf16  | invariant | 680  | 81.0 (0.85x) |
+| 4-bit | stock     | 1472 | 275.2 |
+| 4-bit | invariant | 847  | 129.6 (0.47x) |
+
+The 4-bit gap is the quantized matmul at M=1. Measured pipelined (100
+calls queued per eval) at this model's weight shapes, stock's 4-bit GEMV
+takes 7–24 µs per call where the tile kernel takes 25–58 µs, and a 0.5B
+model issues ~170 of them per token. Dense fp16 at the same shapes is at
+parity. The tile kernel's floor is structural (an 8-row MMA tile staged
+through threadgroup memory per 32-wide slab); simdgroup-scope barriers,
+vectorized dequantization and dropping extra graph ops did not move it.
+Closing it needs a different canonical order for the quantized op (one a
+GEMV can execute), traded against large-M speed, or a leaner MMA-GEMV.
+
+Before the performance pass the matmul kernels were 2.1–3.4x (dense) and
+2.3–6.8x (4-bit) slower than stock, and attention was 4–8x (decode) and
+48–58x (prefill). What moved the numbers, in order of
 effect: staging slabs in the input dtype with 4-wide vector loads and the
 mixed-precision MMA (about 2x at large M); 8-row tiles for M ≤ 32 (about 2x
 at decode); unpacking a whole uint32 per thread in the quantized path
@@ -211,11 +248,12 @@ bits across machines.
 1. ~~Prefill attention with chunk invariance.~~ Done; see structure checks.
 2. ~~Run `model_sweep` on an unquantized checkpoint.~~ Done; clean.
 3. ~~`mx.quantized_matmul` (affine 4/8-bit).~~ Done; clean on a 4-bit model.
-4. ~~Performance (matmul).~~ Done: 1.0–1.4x of stock. Remaining: the
-   attention kernels are still one thread per (batch, head, split) or per
-   query with scalar loads; a threadgroup-per-row version with the same
-   split/merge order would help long contexts. RMSNorm is already
-   bandwidth-bound.
+4. ~~Performance (matmul, decode attention).~~ Done: 1.0–1.5x of stock.
+   Remaining: (a) 4-bit decode at M=1 is 2.3–3.5x stock GPU time (see
+   Results); (b) prefill attention is ~4x stock: the lane-parallel kernel
+   spends ~17 ops per (query, key) pair; an MMA-based QKᵀ/PV with 8-query
+   tiles would fix it but means a new canonical order that decode must
+   share (pad 1 query to 8, like the skinny matmul tile).
 5. **`mx.compile` interplay**: make sure graphs compiled inside the mode keep
    the invariant ops, or document that compilation must happen inside the
    `with` block.
