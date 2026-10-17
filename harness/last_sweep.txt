@@ -1,0 +1,31 @@
+MLX 0.32.4 on Apple M4 (applegpu_g16g)
+batch sizes: [1, 2, 3, 4, 8, 16, 32, 64, 128, 256]
+
+op           dtype     mode       result
+----------------------------------------------------------------
+matmul       float16   STOCK      FAIL @B=2 max|diff|=0.0625
+matmul       float16   INVARIANT  pass
+matmul       bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+matmul       bfloat16  INVARIANT  pass
+matmul       float32   STOCK      FAIL @B=2 max|diff|=0.000427
+matmul       float32   INVARIANT  pass
+addmm        float16   STOCK      FAIL @B=2 max|diff|=0.000977
+addmm        float16   INVARIANT  pass
+addmm        bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+addmm        bfloat16  INVARIANT  pass
+addmm        float32   STOCK      FAIL @B=2 max|diff|=5.25e-06
+addmm        float32   INVARIANT  pass
+rms_norm     float16   STOCK      pass
+rms_norm     float16   INVARIANT  pass
+rms_norm     bfloat16  STOCK      pass
+rms_norm     bfloat16  INVARIANT  pass
+rms_norm     float32   STOCK      pass
+rms_norm     float32   INVARIANT  pass
+sdpa_decode  float16   STOCK      pass
+sdpa_decode  float16   INVARIANT  pass
+sdpa_decode  bfloat16  STOCK      pass
+sdpa_decode  bfloat16  INVARIANT  pass
+sdpa_decode  float32   STOCK      pass
+sdpa_decode  float32   INVARIANT  pass
+
+INVARIANT mode: all probe rows bitwise identical across the sweep.

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-batch-invariant"
+version = "0.0.1"
+description = "Batch-invariant (deterministic) matmul, RMSNorm and decode-attention kernels for MLX on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["mlx>=0.32", "numpy"]
+
+[project.optional-dependencies]
+models = ["mlx-lm"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["mlx_batch_invariant*"]

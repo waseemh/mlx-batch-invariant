@@ -1,0 +1,147 @@
+# mlx-batch-invariant
+
+Batch-invariant (deterministic) kernels for [MLX](https://github.com/ml-explore/mlx)
+on Apple Silicon, following Thinking Machines'
+[*Defeating Nondeterminism in LLM Inference*](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+and their PyTorch library
+[`batch_invariant_ops`](https://github.com/thinking-machines-lab/batch_invariant_ops).
+
+The claim being enforced: **a row's result must not depend on how many other
+rows share the batch.** Stock GPU kernels change their reduction strategy with
+batch size (split-K, tile selection, split-KV), so the same prompt yields
+different bits at temperature 0 depending on server load. These kernels fix
+the reduction order per output element so the bits are identical at batch 1
+and batch 256.
+
+Status: **scaffold.** Correct, invariant, unoptimized. See *Roadmap*.
+
+## Install
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+```
+
+Requires MLX ≥ 0.32 and an Apple GPU (uses `mx.fast.metal_kernel`).
+
+## Use
+
+```python
+import mlx.core as mx
+import mlx_batch_invariant as bi
+
+with bi.set_batch_invariant_mode():
+    logits = model(tokens)        # nn.Linear, nn.RMSNorm, decode SDPA now batch-invariant
+
+print(bi.stats())                 # {'handled': {...}, 'fallbacks': {...}}
+```
+
+`strict=True` raises instead of silently falling back to a stock kernel for
+inputs the batch-invariant kernels don't cover yet. Always check
+`bi.stats()["fallbacks"]`: a run with fallbacks is not deterministic.
+
+## What is overridden
+
+MLX has no `torch.Library`, so the mode monkeypatches the module-level
+functions that `mlx.nn` and `mlx_lm` reach for, and restores them on exit:
+
+| Patched symbol                            | Routed to                              | Falls back when                          |
+|-------------------------------------------|----------------------------------------|------------------------------------------|
+| `mx.matmul`, `mx.array.__matmul__`        | `batch_invariant_matmul`               | rhs not 2-D, non-float dtype             |
+| `mx.addmm`                                | `batch_invariant_matmul` + add         | same                                     |
+| `mx.fast.rms_norm`                        | `batch_invariant_rms_norm`             | non-float                                |
+| `mx.fast.scaled_dot_product_attention`    | `batch_invariant_decode_attention`     | `T_q > 1` (prefill), array mask, sinks   |
+
+Not patched: `mx.quantized_matmul` (quantized checkpoints), batched 3-D
+matmul, `mx.compile`d graphs that captured the stock ops before the mode was
+entered.
+
+## Kernel design
+
+- **matmul** (`kernels/matmul.py`): one tile config (64×64×16) for every
+  shape, no split-K. Each output element is accumulated in fp32 by one thread
+  walking `k = 0..K-1` in order, so its reduction tree depends only on K.
+  Reads the transposed weight view through strides, no copy.
+- **rms_norm** (`kernels/rmsnorm.py`): one 256-thread threadgroup per row,
+  fixed-stride partial sums, fixed-shape tree reduction.
+- **decode attention** (`kernels/attention.py`): fixed split **size** along
+  KV (256 keys), not fixed split count. Key `j` always lands in split
+  `j // 256` at the same position, and splits are merged in index order, so
+  neither batch size nor cache growth changes an existing row's reduction.
+  Two kernels: per-split online softmax, then an ordered combine.
+
+## Harness
+
+```bash
+.venv/bin/python -m harness.sweep --strict          # op-level batch sweep, bitwise
+.venv/bin/python -m pytest -q tests                 # same, as a test suite
+.venv/bin/python -m harness.model_sweep --model <unquantized mlx-community repo> [--decode]
+```
+
+`harness.sweep` embeds a fixed probe row in batches of 1…256 at row 0 and at
+the last row, and compares the probe's output bitwise to its batch-1 result,
+for stock MLX and for the invariant mode. `harness.model_sweep` does the same
+through an `mlx_lm` model and reports the first transformer block whose
+output for the prompt row diverges. It has **not yet been run against a real
+checkpoint**.
+
+### Results on this machine (MLX 0.32.4, Apple M4)
+
+```
+op           dtype     mode       result
+----------------------------------------------------------------
+matmul       float16   STOCK      FAIL @B=2 max|diff|=0.0625
+matmul       float16   INVARIANT  pass
+matmul       bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+matmul       bfloat16  INVARIANT  pass
+matmul       float32   STOCK      FAIL @B=2 max|diff|=0.000427
+matmul       float32   INVARIANT  pass
+addmm        float16   STOCK      FAIL @B=2 max|diff|=0.000977
+addmm        float16   INVARIANT  pass
+addmm        bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+addmm        bfloat16  INVARIANT  pass
+addmm        float32   STOCK      FAIL @B=2 max|diff|=5.25e-06
+addmm        float32   INVARIANT  pass
+rms_norm     *         STOCK      pass
+rms_norm     *         INVARIANT  pass
+sdpa_decode  *         STOCK      pass        (also at KV length 4k, 16k, 64k)
+sdpa_decode  *         INVARIANT  pass
+```
+
+Takeaway so far: on MLX the batch dependence is in the GEMM (stock
+`mx.matmul` already differs between batch 1 and batch 2, K=N=4096). Stock
+`rms_norm` and decode SDPA were observed invariant up to 64k keys, so those
+two kernels currently turn an observation into a guarantee rather than fix a
+measured failure. That may change with other MLX versions or chips; the
+harness is the thing to trust, not this table.
+
+Determinism is per (MLX version, chip, macOS). Nothing here claims identical
+bits across machines.
+
+## Roadmap
+
+1. **Prefill attention** with chunk invariance (same bits whether a prompt is
+   processed in one chunk or several, and with prefix caching). Needed before
+   `model_sweep` is meaningful end to end.
+2. **Run `model_sweep`** on an unquantized `mlx_lm` checkpoint; fix what it
+   finds (embedding gather, lm_head, residual adds are candidates).
+3. **`mx.quantized_matmul`**: affine-dequant + fixed-order accumulate, so
+   4-bit checkpoints are covered. Likely the most-used path on Macs.
+4. **Performance**: simdgroup matmul tiles with a fixed K order, vectorized
+   loads, a threadgroup-per-(b,h,split) attention kernel instead of one
+   thread. Target: within ~20–30% of stock, as the original work reports.
+5. **`mx.compile` interplay**: make sure graphs compiled inside the mode keep
+   the invariant ops, or document that compilation must happen inside the
+   `with` block.
+6. Check `mlx_lm` batched generation and its KV cache chunking (256-token
+   growth, slicing) under the mode; verify the view handling doesn't
+   reintroduce a copy-then-split path.
+
+## Layout
+
+```
+mlx_batch_invariant/   package: _mode.py (override), ops.py (fallback accounting), kernels/
+harness/               sweep.py (op-level), model_sweep.py (mlx_lm end-to-end)
+tests/                 pytest wrapper around the sweep + mode contract tests
+```
+
+MIT.
