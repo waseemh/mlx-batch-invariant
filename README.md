@@ -16,8 +16,8 @@ and batch 256.
 Status: **works end to end on `mlx_lm` models, unquantized and 4-bit**
 (Qwen2.5-0.5B bf16 and its 4-bit affine quantization): bitwise-identical
 logits at batch 1, 4, 16 and 64, in prefill and in cached decode, with no
-fallbacks. Kernels are correct and invariant but 2–5x slower than stock.
-See *Results* and *Roadmap*.
+fallbacks. Matmul kernels run within 1.0–1.4x of stock MLX. See *Results*
+and *Roadmap*.
 
 ## Install
 
@@ -61,15 +61,28 @@ Not patched: batched 3-D matmul, mxfp4/mxfp8/nvfp4 quantization modes, and
 
 ## Kernel design
 
-- **matmul** (`kernels/matmul.py`): one tile config (64×64×16) for every
-  shape, no split-K. Each output element is accumulated in fp32 by one thread
-  walking `k = 0..K-1` in order, so its reduction tree depends only on K.
-  Reads the transposed weight view through strides, no copy.
-- **quantized matmul** (`kernels/quantized.py`): same tile and K-order
-  contract as matmul. MLX's affine format packs `bits`-wide codes low-to-high
-  in uint32 words with one scale and bias per `group_size` codes of a row;
-  the kernel dequantizes in fp32 while staging the weight slab, then runs the
-  identical fixed-order fma loop. Covers 4- and 8-bit, group 32/64/128,
+- **matmul** (`kernels/matmul.py`): the canonical order is *K cut into fixed
+  256-wide groups; inside a group, slabs of 32 fed to the hardware
+  `simdgroup_multiply_accumulate` in steps of 8 (operands in the input
+  dtype, fp32 accumulator); group partials folded left to right with plain
+  fp32 adds.* Every launch shape executes exactly that sequence per output
+  element, so the launch can adapt to M without the bits changing:
+  - **M ≤ 32** uses 8-row tiles (a decode step no longer pads one row to
+    sixty-four) and one threadgroup per (tile, K group), writing fp32 group
+    partials that a second kernel folds. Parallelism along K is fine as long
+    as the group boundaries never move with M; this is the "fixed split
+    size" idea from the post applied to GEMM.
+  - **M > 32** uses 64-row tiles and folds all groups inside one
+    threadgroup.
+  Slabs are staged `[row][k]` with 4-wide vector loads and a padded leading
+  dimension; B is read through its strides, so the transposed weight view
+  from `nn.Linear` is consumed in place.
+- **quantized matmul** (`kernels/quantized.py`): the same tile body with one
+  change: the B slab is dequantized to fp32 while it is staged. MLX's affine
+  format packs `bits`-wide codes low-to-high in uint32 words with one scale
+  and bias per `group_size` codes of a row; each thread unpacks a whole word,
+  so global reads are coalesced word loads. Uses the fp32 MMA (an op only has
+  to be consistent with itself). Covers 4- and 8-bit, group 32/64/128,
   `transpose=True` (the `nn.QuantizedLinear` layout).
 - **rms_norm** (`kernels/rmsnorm.py`): one 256-thread threadgroup per row,
   fixed-stride partial sums, fixed-shape tree reduction.
@@ -163,17 +176,22 @@ matmul, norm and attention call in the model went through the
 batch-invariant kernels. Block 0 diverging under stock MLX is the GEMM
 result above showing up at the first linear layer.
 
-### Speed (K=N=4096, fp16, M4, per call)
+### Speed (K=N=4096, fp16, M4, ms per call, `python -m harness.bench`)
 
 | M   | dense stock | dense invariant | 4-bit stock | 4-bit invariant |
 |-----|-------------|-----------------|-------------|-----------------|
-| 1   | 0.62 ms     | 2.08 ms (3.4x)  | 0.48 ms     | 2.61 ms (5.4x)  |
-| 64  | 0.97 ms     | 2.01 ms (2.1x)  | 1.01 ms     | 2.28 ms (2.3x)  |
-| 512 | 4.92 ms     | 12.29 ms (2.5x) | 5.35 ms     | 14.26 ms (2.7x) |
+| 1   | 0.67        | 0.68 (1.0x)     | 0.33        | 0.46 (1.4x)     |
+| 8   | 0.58        | 0.72 (1.2x)     | 0.49        | 0.50 (1.0x)     |
+| 64  | 0.99        | 1.26 (1.3x)     | 0.98        | 1.24 (1.3x)     |
+| 512 | 5.00        | 6.48 (1.3x)     | 5.36        | 6.69 (1.2x)     |
 
-Decode (M=1) is the worst case: the kernel is a plain 64×64 tile with
-scalar loads and no simdgroup matrix ops, and at M=1 it wastes 63/64 of each
-tile. Performance work is the next item.
+Before the performance pass the same kernels were 2.1–3.4x (dense) and
+2.3–6.8x (4-bit) slower than stock. What moved the numbers, in order of
+effect: staging slabs in the input dtype with 4-wide vector loads and the
+mixed-precision MMA (about 2x at large M); 8-row tiles for M ≤ 32 (about 2x
+at decode); unpacking a whole uint32 per thread in the quantized path
+(about 5x at decode for 4-bit). Threadgroup-memory padding and loop
+unrolling made no measurable difference here.
 
 Takeaways: on MLX the batch dependence is in the GEMM (stock
 `mx.matmul` already differs between batch 1 and batch 2, K=N=4096). Stock
@@ -193,11 +211,11 @@ bits across machines.
 1. ~~Prefill attention with chunk invariance.~~ Done; see structure checks.
 2. ~~Run `model_sweep` on an unquantized checkpoint.~~ Done; clean.
 3. ~~`mx.quantized_matmul` (affine 4/8-bit).~~ Done; clean on a 4-bit model.
-4. **Performance**: simdgroup matmul tiles with a fixed K order, vectorized
-   and word-at-a-time dequant loads, a skinny-M path for decode (M ≤ 8) that
-   keeps the same per-element K order, a threadgroup-per-(b,h,split)
-   attention kernel instead of one thread. Target: within ~20–30% of stock,
-   as the original work reports.
+4. ~~Performance (matmul).~~ Done: 1.0–1.4x of stock. Remaining: the
+   attention kernels are still one thread per (batch, head, split) or per
+   query with scalar loads; a threadgroup-per-row version with the same
+   split/merge order would help long contexts. RMSNorm is already
+   bandwidth-bound.
 5. **`mx.compile` interplay**: make sure graphs compiled inside the mode keep
    the invariant ops, or document that compilation must happen inside the
    `with` block.

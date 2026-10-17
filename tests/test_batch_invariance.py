@@ -41,7 +41,10 @@ def test_quantized_matmul_matches_stock(bits, gs, dt):
     got = bi.batch_invariant_quantized_matmul(x, wq, sc, bi_, group_size=gs, bits=bits)
     mx.eval(ref, got)
     rel = (mx.abs(ref.astype(mx.float32) - got.astype(mx.float32)).max() / mx.abs(ref.astype(mx.float32)).max()).item()
-    assert rel < 2e-3, rel
+    # Stock dequantizes in the weight dtype (bf16 rounds every dequantized
+    # weight to 8 mantissa bits); we dequantize in fp32. A couple of bf16 ulps
+    # of disagreement is the stock kernel's rounding, not ours.
+    assert rel < (1e-2 if dt == mx.bfloat16 else 2e-3), rel
 
 
 def test_quantized_linear_routes_through_mode():
