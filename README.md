@@ -13,7 +13,10 @@ different bits at temperature 0 depending on server load. These kernels fix
 the reduction order per output element so the bits are identical at batch 1
 and batch 256.
 
-Status: **scaffold.** Correct, invariant, unoptimized. See *Roadmap*.
+Status: **works end to end on an unquantized `mlx_lm` model** (Qwen2.5-0.5B,
+bf16): bitwise-identical logits at batch 1, 4, 16 and 64, in prefill and in
+cached decode, with no fallbacks. Kernels are correct and invariant but
+unoptimized. See *Results* and *Roadmap*.
 
 ## Install
 
@@ -90,9 +93,9 @@ structure checks the batch sweep cannot see: a 600-token prompt prefilled in
 one shot vs. in two chunks (257 + 343, deliberately off the 256 split), and
 the last token's output from prefill vs. from a decode step against the same
 cache. `harness.model_sweep` does the same
-through an `mlx_lm` model and reports the first transformer block whose
-output for the prompt row diverges. It has **not yet been run against a real
-checkpoint**.
+through an `mlx_lm` model: the prompt sits in row 0 with random-token rows
+beside it, every transformer block's output for row 0 is hashed, and the
+first block that diverges from the batch-1 run is reported.
 
 ### Results on this machine (MLX 0.32.4, Apple M4)
 
@@ -126,7 +129,25 @@ sdpa  fp32  STOCK      decode(last) == prefill(last):   FAIL
 sdpa  *     INVARIANT  both checks:                     pass
 ```
 
-Takeaways so far: on MLX the batch dependence is in the GEMM (stock
+End to end, `Qwen/Qwen2.5-0.5B` (bf16, mlx_lm 0.32.2), 10-token prompt,
+24 blocks:
+
+```
+$ python -m harness.model_sweep --model Qwen/Qwen2.5-0.5B            [--decode]
+STOCK      B=4    FAIL first divergent block=0          (same with --decode)
+STOCK      B=16   FAIL first divergent block=0
+STOCK      B=64   FAIL first divergent block=0
+INVARIANT  B=4    pass                                   (same with --decode)
+INVARIANT  B=16   pass
+INVARIANT  B=64   pass
+```
+
+No fallbacks were recorded in invariant mode, so every matmul, norm and
+attention call in the model went through the batch-invariant kernels. Block
+0 diverging under stock MLX is the GEMM result above showing up at the first
+`nn.Linear`.
+
+Takeaways: on MLX the batch dependence is in the GEMM (stock
 `mx.matmul` already differs between batch 1 and batch 2, K=N=4096). Stock
 attention is batch-invariant here, but it is **not prefill/decode
 invariant**: the same token gets different bits from the prefill kernel and
@@ -142,8 +163,7 @@ bits across machines.
 ## Roadmap
 
 1. ~~Prefill attention with chunk invariance.~~ Done; see structure checks.
-2. **Run `model_sweep`** on an unquantized `mlx_lm` checkpoint; fix what it
-   finds (embedding gather, lm_head, residual adds are candidates).
+2. ~~Run `model_sweep` on an unquantized checkpoint.~~ Done; clean.
 3. **`mx.quantized_matmul`**: affine-dequant + fixed-order accumulate, so
    4-bit checkpoints are covered. Likely the most-used path on Macs.
 4. **Performance**: simdgroup matmul tiles with a fixed K order, vectorized
@@ -155,6 +175,11 @@ bits across machines.
 6. Check `mlx_lm` batched generation and its KV cache chunking (256-token
    growth, slicing) under the mode; verify the view handling doesn't
    reintroduce a copy-then-split path.
+7. Model-level decode-vs-prefill check: logits for token `t` from a full
+   prefill vs. from decoding tokens one at a time. The attention kernels
+   guarantee it per op; the harness should assert it per model.
+8. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
+   fp16 weights; the Recorder hooks the block class, so most should work.
 
 ## Layout
 

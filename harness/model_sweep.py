@@ -13,9 +13,10 @@ length (so no padding mask is needed). Every transformer block's output for
 row 0 is hashed and compared to the batch-1 run, under stock MLX and under
 ``set_batch_invariant_mode``.
 
-NOTE: this script has not been run against a real checkpoint yet (no model
-download was done while scaffolding). The mlx_lm calls follow its public
-API; expect to adjust ``_blocks()`` for exotic architectures.
+Verified on Qwen/Qwen2.5-0.5B (bf16, mlx_lm 0.32.2): stock diverges at
+block 0 from batch 4 on; invariant mode is bitwise clean at B=4/16/64 in
+both modes with no fallbacks. Expect to adjust ``_blocks()`` for exotic
+architectures.
 """
 
 from __future__ import annotations
@@ -28,10 +29,11 @@ import mlx.core as mx
 import numpy as np
 
 import mlx_batch_invariant as bi
+from harness.sweep import bits
 
 
 def _hash(x: mx.array) -> str:
-    return hashlib.blake2b(np.array(x).tobytes(), digest_size=8).hexdigest()
+    return hashlib.blake2b(bits(x), digest_size=8).hexdigest()
 
 
 def _blocks(model):
