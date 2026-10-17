@@ -13,6 +13,7 @@ import time
 import mlx.core as mx
 
 import mlx_batch_invariant as bi
+from mlx_batch_invariant._compat import device_info
 
 
 def bench(f, iters=20, warm=3):
@@ -67,12 +68,12 @@ def main(argv=None):
     K, N = a.k, a.n
     mx.random.seed(0)
     if a.attention:
-        info = mx.device_info()
+        info = device_info()
         print(f"MLX {mx.__version__} on {info.get('device_name')} {a.dtype}\n")
         return bench_attention(dt)
     W = mx.random.normal((N, K)).astype(dt)
     wq, sc, b = mx.quantize(W, group_size=64, bits=4)
-    info = mx.device_info()
+    info = device_info()
     print(f"MLX {mx.__version__} on {info.get('device_name')}  K=N={K if K == N else (K, N)} {a.dtype}, ms per call\n")
     print("| M | dense stock | dense invariant | 4-bit stock | 4-bit invariant |")
     print("|---|---|---|---|---|")

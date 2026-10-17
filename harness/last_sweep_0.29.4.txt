@@ -1,0 +1,63 @@
+MLX 0.29.4 on Apple M4 (applegpu_g16g)
+batch sizes: [1, 2, 3, 4, 8, 16, 32, 64, 128, 256]
+
+op           dtype     mode       result
+----------------------------------------------------------------
+matmul       float16   STOCK      FAIL @B=2 max|diff|=0.0625
+matmul       float16   INVARIANT  pass
+matmul       bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+matmul       bfloat16  INVARIANT  pass
+matmul       float32   STOCK      FAIL @B=2 max|diff|=0.000427
+matmul       float32   INVARIANT  pass
+addmm        float16   STOCK      FAIL @B=2 max|diff|=0.000977
+addmm        float16   INVARIANT  pass
+addmm        bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
+addmm        bfloat16  INVARIANT  pass
+addmm        float32   STOCK      FAIL @B=2 max|diff|=5.25e-06
+addmm        float32   INVARIANT  pass
+qmatmul_4b   float16   STOCK      FAIL @B=16 max|diff|=0.25
+qmatmul_4b   float16   INVARIANT  pass
+qmatmul_4b   bfloat16  STOCK      FAIL @B=16 max|diff|=1.75
+qmatmul_4b   bfloat16  INVARIANT  pass
+qmatmul_4b   float32   STOCK      FAIL @B=16 max|diff|=0.000534
+qmatmul_4b   float32   INVARIANT  pass
+qmatmul_8b   float16   STOCK      FAIL @B=16 max|diff|=0.125
+qmatmul_8b   float16   INVARIANT  pass
+qmatmul_8b   bfloat16  STOCK      FAIL @B=16 max|diff|=1
+qmatmul_8b   bfloat16  INVARIANT  pass
+qmatmul_8b   float32   STOCK      FAIL @B=16 max|diff|=0.000458
+qmatmul_8b   float32   INVARIANT  pass
+rms_norm     float16   STOCK      pass
+rms_norm     float16   INVARIANT  pass
+rms_norm     bfloat16  STOCK      pass
+rms_norm     bfloat16  INVARIANT  pass
+rms_norm     float32   STOCK      pass
+rms_norm     float32   INVARIANT  pass
+sdpa_decode  float16   STOCK      pass
+sdpa_decode  float16   INVARIANT  pass
+sdpa_decode  bfloat16  STOCK      pass
+sdpa_decode  bfloat16  INVARIANT  pass
+sdpa_decode  float32   STOCK      pass
+sdpa_decode  float32   INVARIANT  pass
+sdpa_prefill float16   STOCK      pass
+sdpa_prefill float16   INVARIANT  pass
+sdpa_prefill bfloat16  STOCK      pass
+sdpa_prefill bfloat16  INVARIANT  pass
+sdpa_prefill float32   STOCK      pass
+sdpa_prefill float32   INVARIANT  pass
+
+attention structure checks (chunked prefill, decode vs prefill):
+sdpa         fp16      STOCK      chunked_prefill == full_prefill: pass
+sdpa         fp16      STOCK      decode(last) == prefill(last): FAIL
+sdpa         fp16      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         fp16      INVARIANT  decode(last) == prefill(last): pass
+sdpa         bf16      STOCK      chunked_prefill == full_prefill: pass
+sdpa         bf16      STOCK      decode(last) == prefill(last): FAIL
+sdpa         bf16      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         bf16      INVARIANT  decode(last) == prefill(last): pass
+sdpa         fp32      STOCK      chunked_prefill == full_prefill: pass
+sdpa         fp32      STOCK      decode(last) == prefill(last): FAIL
+sdpa         fp32      INVARIANT  chunked_prefill == full_prefill: pass
+sdpa         fp32      INVARIANT  decode(last) == prefill(last): pass
+
+INVARIANT mode: all probe rows bitwise identical across the sweep.

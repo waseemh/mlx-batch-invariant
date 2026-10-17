@@ -200,11 +200,11 @@ _SRC = """
                 // A block whose keys are all masked for this row leaves m at -inf;
                 // exp(-inf - -inf) would be NaN. corr = 1 makes the block an exact
                 // no-op, so a row's bits do not depend on its tile-mates' key ranges.
-                const float corr = (m_new == -INFINITY) ? 1.0f : metal::exp(m_old - m_new);
+                const float corr = (m_new == -INFINITY) ? 1.0f : metal::precise::exp(m_old - m_new);
                 float t2 = 0.0f;
                 @UNROLL@
                 for (int c = 0; c < CPL; ++c) {
-                    const float pc = (sv[c] == -INFINITY) ? 0.0f : metal::exp(sv[c] - m_new);
+                    const float pc = (sv[c] == -INFINITY) ? 0.0f : metal::precise::exp(sv[c] - m_new);
                     t2 = t2 + pc;                       // sequential within the lane
                     Ps[r * LDP + scol + c] = (T)pc;
                 }
@@ -251,8 +251,8 @@ _SRC = """
             const int r = lane;
             const float m = rm[r], l = rl[r];
             const float M_new = metal::max(Mt[r], m);
-            co[r] = metal::exp(Mt[r] - M_new);
-            cn[r] = metal::exp(m - M_new);
+            co[r] = metal::precise::exp(Mt[r] - M_new);
+            cn[r] = metal::precise::exp(m - M_new);
             Lt[r] = fma(Lt[r], co[r], l * cn[r]);
             Mt[r] = M_new;
         }
@@ -286,7 +286,7 @@ _FINAL_BLOCK = """
     for (int e = lane; e < 8 * D; e += 32) {
         const int r = e / D, d = e % D;
         if (nkeys[r] > 0)
-            out[(((size_t)b * Hq + row_hq[r]) * Tq + row_qi[r]) * D + d] = (T)(At[e] / Lt[r]);
+            out[(((size_t)b * Hq + row_hq[r]) * Tq + row_qi[r]) * D + d] = (T)metal::precise::divide(At[e], Lt[r]);
     }
 """
 
@@ -305,13 +305,13 @@ _COMBINE_SRC = """
         const float l = pl[po];
         const float acc = pacc[po * D + d];
         float M_new = metal::max(M, m);
-        float c_old = metal::exp(M - M_new);
-        float c_new = metal::exp(m - M_new);
+        float c_old = metal::precise::exp(M - M_new);
+        float c_new = metal::precise::exp(m - M_new);
         Ls = fma(Ls, c_old, l * c_new);
         A = fma(A, c_old, acc * c_new);
         M = M_new;
     }
-    out[(size_t)bh * D + d] = (T)(A / Ls);
+    out[(size_t)bh * D + d] = (T)metal::precise::divide(A, Ls);
 """
 
 _kernels: dict = {}

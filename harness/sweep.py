@@ -24,6 +24,7 @@ import mlx.nn as nn
 import numpy as np
 
 import mlx_batch_invariant as bi
+from mlx_batch_invariant._compat import device_info
 
 DTYPES = {"fp16": mx.float16, "bf16": mx.bfloat16, "fp32": mx.float32}
 DEFAULT_BATCHES = [1, 2, 3, 4, 8, 16, 32, 64, 128, 256]
@@ -256,7 +257,7 @@ def main(argv=None) -> int:
     p.add_argument("--strict", action="store_true", help="exit 1 if INVARIANT mode fails anywhere")
     a = p.parse_args(argv)
 
-    info = mx.device_info()
+    info = device_info()
     print(f"MLX {mx.__version__} on {info.get('device_name')} ({info.get('architecture')})")
     print(f"batch sizes: {a.batch_sizes}\n")
     print(f"{'op':<12} {'dtype':<9} {'mode':<10} result")

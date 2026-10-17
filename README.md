@@ -15,7 +15,9 @@ and batch 256.
 
 Status: **works end to end on `mlx_lm` models across three architectures
 (Qwen2, Llama, GPT-2), unquantized and 4-bit**: bitwise-identical logits at
-batch 1, 4, 16 and 64, in prefill and in cached decode, with no fallbacks. Matmul and decode attention run within 1.0–1.5x of stock MLX;
+batch 1, 4, 16 and 64, in prefill and in cached decode, with no fallbacks,
+**on MLX 0.29.4 and 0.32.4, with identical bits across the two versions**
+(stock MLX changes its bits between them). Matmul and decode attention run within 1.0–1.5x of stock MLX;
 prefill attention is ~4x off; end-to-end generation on a 0.5B model is 1.2x
 slower (bf16) and 2.1x slower (4-bit). See *Results* and *Roadmap*.
 
@@ -25,7 +27,8 @@ slower (bf16) and 2.1x slower (4-bit). See *Results* and *Roadmap*.
 python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
-Requires MLX ≥ 0.32 and an Apple GPU (uses `mx.fast.metal_kernel`).
+Requires MLX ≥ 0.29 and an Apple GPU (uses `mx.fast.metal_kernel`). Tested
+on 0.29.4 and 0.32.4; `_compat.py` covers the API differences.
 
 ## Use
 
@@ -111,7 +114,8 @@ Not patched: batched 3-D matmul, mxfp4/mxfp8/nvfp4 quantization modes, and
 .venv/bin/python -m harness.generate_bench --model <mlx_lm model>   # tokens/s, reproducibility
 ```
 
-`harness.sweep` embeds a fixed probe row in batches of 1…256 at row 0 and at
+`harness.dump_bits` records bit hashes for cross-version or cross-machine
+comparison (see *Across MLX versions*). `harness.sweep` embeds a fixed probe row in batches of 1…256 at row 0 and at
 the last row, and compares the probe's output bitwise to its batch-1 result,
 for stock MLX and for the invariant mode. It then runs two attention
 structure checks the batch sweep cannot see: a 600-token prompt prefilled in
@@ -292,8 +296,30 @@ here close it. Stock `rms_norm` was observed invariant, so that kernel turns
 an observation into a guarantee rather than fixing a measured failure. That may change with other MLX versions or chips; the
 harness is the thing to trust, not this table.
 
-Determinism is per (MLX version, chip, macOS). Nothing here claims identical
-bits across machines.
+### Across MLX versions
+
+`python -m harness.dump_bits` hashes every op probe and a model's logits;
+`--compare` diffs two dumps. MLX 0.29.4 vs 0.32.4, same M4, same macOS:
+
+| | stock MLX | invariant mode |
+|---|---|---|
+| op probes identical across versions | 16 / 21 | **21 / 21** |
+| Qwen2.5-0.5B logits identical (prefill, decode) | 0 / 2 | **2 / 2** |
+
+Stock changes bits between versions in quantized matmul and prefill
+attention, so a model's logits move on upgrade. The invariant kernels did
+too at first, for one reason: MLX 0.32 compiles custom kernels with fast
+math and 0.29 did not, so `metal::exp` and `metal::rsqrt` resolved to
+different implementations (measured: 0.32's `exp` is correctly rounded 22%
+of the time, 0.29's 63%). `fma`, `max`, division and the simdgroup MMA were
+identical either way. The kernels now call `metal::precise::exp`,
+`precise::rsqrt` and `precise::divide` explicitly, which are bit-identical
+on both versions, at no measurable cost. The stock failures (batch
+dependence, decode ≠ prefill) reproduce on 0.29.4 as well.
+
+Determinism is still per chip and macOS: nothing here claims identical bits
+across machines, and a Metal compiler change in a future macOS could move
+`precise::exp`. The dump/compare tool is how to find out.
 
 ## Roadmap
 
@@ -317,12 +343,14 @@ bits across machines.
 7. Model-level decode-vs-prefill check: logits for token `t` from a full
    prefill vs. from decoding tokens one at a time. The attention kernels
    guarantee it per op; the harness should assert it per model.
-8. Other quantization modes (`mxfp4`, `mxfp8`, `nvfp4`) and `transpose=False`.
-9. A batch-invariant `mx.fast.layer_norm` so GPT-2-style models rest on a
+8. A second machine (another Apple chip generation, another macOS) through
+   `harness.dump_bits --compare`.
+9. Other quantization modes (`mxfp4`, `mxfp8`, `nvfp4`) and `transpose=False`.
+10. A batch-invariant `mx.fast.layer_norm` so GPT-2-style models rest on a
    guarantee rather than an observation.
-10. ~~Try other architectures~~ Done for Qwen2, Llama, GPT-2 (see the model
+11. ~~Try other architectures~~ Done for Qwen2, Llama, GPT-2 (see the model
    table); Gemma, Mistral, Phi and Qwen3 still untested (no cached weights).
-11. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
+12. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
    fp16 weights; the Recorder hooks the block class, so most should work.
 
 ## Layout

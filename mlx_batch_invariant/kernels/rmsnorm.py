@@ -37,7 +37,7 @@ _SOURCE = f"""
         if (t < s) red[t] += red[t + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
-    const float inv = metal::rsqrt(red[0] / (float)D + eps[0]);
+    const float inv = metal::precise::rsqrt(red[0] / (float)D + eps[0]);
 
     // 3) normalize + scale
     for (int i = t; i < D; i += {TG}) {{

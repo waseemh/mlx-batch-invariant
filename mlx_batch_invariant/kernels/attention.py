@@ -64,8 +64,8 @@ _KEY_UPDATE = """
                 const float s = simd_shuffle(part, 0);
                 if (ACTIVE(iq)) {
                     float m_new = metal::max(m[iq], s);
-                    float corr  = metal::exp(m[iq] - m_new);
-                    float p     = metal::exp(s - m_new);
+                    float corr  = metal::precise::exp(m[iq] - m_new);
+                    float p     = metal::precise::exp(s - m_new);
                     l[iq] = fma(l[iq], corr, p);
                     @UNROLL@
                     for (int d = 0; d < DL; ++d) acc[iq][d] = fma(acc[iq][d], corr, p * vreg[d]);
@@ -76,8 +76,8 @@ _KEY_UPDATE = """
 
 _MERGE = """
                 float M_new = metal::max(M[iq], m[iq]);
-                float c_old = metal::exp(M[iq] - M_new);
-                float c_new = metal::exp(m[iq] - M_new);
+                float c_old = metal::precise::exp(M[iq] - M_new);
+                float c_new = metal::precise::exp(m[iq] - M_new);
                 Ls[iq] = fma(Ls[iq], c_old, l[iq] * c_new);
                 @UNROLL@
                 for (int d = 0; d < DL; ++d) A[iq][d] = fma(A[iq][d], c_old, acc[iq][d] * c_new);
@@ -161,13 +161,13 @@ _COMBINE_SRC = """
         const float l = pl[po];
         const float acc = pacc[po * D + d];
         float M_new = metal::max(M, m);
-        float c_old = metal::exp(M - M_new);
-        float c_new = metal::exp(m - M_new);
+        float c_old = metal::precise::exp(M - M_new);
+        float c_new = metal::precise::exp(m - M_new);
         Ls = fma(Ls, c_old, l * c_new);
         A = fma(A, c_old, acc * c_new);
         M = M_new;
     }
-    out[(size_t)bh * D + d] = (T)(A / Ls);
+    out[(size_t)bh * D + d] = (T)metal::precise::divide(A, Ls);
 """
 
 _PREFILL_SRC = """
@@ -246,7 +246,7 @@ _PREFILL_SRC = """
         if (q0 + iq < Tq) {
             const size_t o = (((size_t)b * Hq + h) * Tq + q0 + iq) * D;
             @UNROLL@
-            for (int d = 0; d < DL; ++d) out[o + lane * DL + d] = (T)(A[iq][d] / Ls[iq]);
+            for (int d = 0; d < DL; ++d) out[o + lane * DL + d] = (T)metal::precise::divide(A[iq][d], Ls[iq]);
         }
     }
     #undef NQ

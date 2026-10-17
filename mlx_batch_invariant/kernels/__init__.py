@@ -8,6 +8,12 @@ share the launch. Concretely:
   quantized matmul with on-the-fly fp32 dequantization)
 * one threadgroup per row with a fixed-shape reduction tree (rmsnorm)
 * fixed split *size* along the KV axis, combined in a fixed order (attention)
+
+Transcendentals and division use ``metal::precise::`` explicitly. MLX 0.32
+compiles custom kernels with fast math, 0.29 did not, and ``metal::exp`` /
+``metal::rsqrt`` then resolve to different implementations; the precise ones
+are bit-identical across both (measured), so the kernels' bits survive an
+MLX upgrade. ``fma``, ``max`` and the simdgroup MMA are exact either way.
 """
 
 from .matmul import batch_invariant_matmul

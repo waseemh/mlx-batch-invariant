@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from .._compat import result_type
+
 GROUP_K = 256      # fixed K chunk; never depends on M
 SPLIT_M_MAX = 32   # M <= this: skinny tiles + one K group per threadgroup
 
@@ -326,7 +328,7 @@ def batch_invariant_matmul(a: mx.array, b: mx.array) -> mx.array:
     if K != b.shape[0]:
         raise ValueError(f"shape mismatch {a.shape} @ {b.shape}")
     N = b.shape[1]
-    out_dtype = mx.result_type(a, b)
+    out_dtype = result_type(a, b)
     a2 = a.reshape(-1, K) if a.ndim != 2 else a
     if a2.dtype != out_dtype:
         a2 = a2.astype(out_dtype)
