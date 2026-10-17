@@ -8,8 +8,10 @@ and model code reach for (``mx.matmul``, ``mx.addmm``, ``mx.fast.rms_norm``,
 ``mx.addmm``; ``nn.RMSNorm`` uses ``mx.fast.rms_norm``; ``mlx_lm`` attention
 uses ``mx.fast.scaled_dot_product_attention``. All four are covered.
 
-Not covered (falls back, counted): ``mx.quantized_matmul`` (quantized
-weights), batched 3-D matmul, prefill attention, masked/sinks attention.
+``nn.QuantizedLinear`` uses ``mx.quantized_matmul``; affine 4/8-bit with
+group size 32/64/128 is covered. Not covered (falls back, counted): other
+quantization modes (mxfp4, nvfp4, ...), batched 3-D matmul, array-mask or
+sinks attention.
 """
 
 from __future__ import annotations
@@ -35,12 +37,14 @@ def _apply():
     _saved = {
         "matmul": mx.matmul,
         "addmm": mx.addmm,
+        "quantized_matmul": mx.quantized_matmul,
         "rms_norm": mx.fast.rms_norm,
         "sdpa": mx.fast.scaled_dot_product_attention,
         "array_matmul": mx.array.__matmul__,
     }
     mx.matmul = ops.matmul
     mx.addmm = ops.addmm
+    mx.quantized_matmul = ops.quantized_matmul
     mx.fast.rms_norm = ops.rms_norm
     mx.fast.scaled_dot_product_attention = ops.scaled_dot_product_attention
     mx.array.__matmul__ = _patched_array_matmul
@@ -49,6 +53,7 @@ def _apply():
 def _restore():
     mx.matmul = _saved["matmul"]
     mx.addmm = _saved["addmm"]
+    mx.quantized_matmul = _saved["quantized_matmul"]
     mx.fast.rms_norm = _saved["rms_norm"]
     mx.fast.scaled_dot_product_attention = _saved["sdpa"]
     mx.array.__matmul__ = _saved["array_matmul"]

@@ -13,10 +13,11 @@ different bits at temperature 0 depending on server load. These kernels fix
 the reduction order per output element so the bits are identical at batch 1
 and batch 256.
 
-Status: **works end to end on an unquantized `mlx_lm` model** (Qwen2.5-0.5B,
-bf16): bitwise-identical logits at batch 1, 4, 16 and 64, in prefill and in
-cached decode, with no fallbacks. Kernels are correct and invariant but
-unoptimized. See *Results* and *Roadmap*.
+Status: **works end to end on `mlx_lm` models, unquantized and 4-bit**
+(Qwen2.5-0.5B bf16 and its 4-bit affine quantization): bitwise-identical
+logits at batch 1, 4, 16 and 64, in prefill and in cached decode, with no
+fallbacks. Kernels are correct and invariant but 2–5x slower than stock.
+See *Results* and *Roadmap*.
 
 ## Install
 
@@ -51,12 +52,12 @@ functions that `mlx.nn` and `mlx_lm` reach for, and restores them on exit:
 |-------------------------------------------|----------------------------------------|------------------------------------------|
 | `mx.matmul`, `mx.array.__matmul__`        | `batch_invariant_matmul`               | rhs not 2-D, non-float dtype             |
 | `mx.addmm`                                | `batch_invariant_matmul` + add         | same                                     |
+| `mx.quantized_matmul`                     | `batch_invariant_quantized_matmul`     | mode ≠ affine, transpose=False, bits ∉ {4,8}, group ∉ {32,64,128} |
 | `mx.fast.rms_norm`                        | `batch_invariant_rms_norm`             | non-float                                |
 | `mx.fast.scaled_dot_product_attention`    | `batch_invariant_attention`            | array mask, sinks                        |
 
-Not patched: `mx.quantized_matmul` (quantized checkpoints), batched 3-D
-matmul, `mx.compile`d graphs that captured the stock ops before the mode was
-entered.
+Not patched: batched 3-D matmul, mxfp4/mxfp8/nvfp4 quantization modes, and
+`mx.compile`d graphs that captured the stock ops before the mode was entered.
 
 ## Kernel design
 
@@ -64,6 +65,12 @@ entered.
   shape, no split-K. Each output element is accumulated in fp32 by one thread
   walking `k = 0..K-1` in order, so its reduction tree depends only on K.
   Reads the transposed weight view through strides, no copy.
+- **quantized matmul** (`kernels/quantized.py`): same tile and K-order
+  contract as matmul. MLX's affine format packs `bits`-wide codes low-to-high
+  in uint32 words with one scale and bias per `group_size` codes of a row;
+  the kernel dequantizes in fp32 while staging the weight slab, then runs the
+  identical fixed-order fma loop. Covers 4- and 8-bit, group 32/64/128,
+  `transpose=True` (the `nn.QuantizedLinear` layout).
 - **rms_norm** (`kernels/rmsnorm.py`): one 256-thread threadgroup per row,
   fixed-stride partial sums, fixed-shape tree reduction.
 - **attention** (`kernels/attention.py`): fixed split **size** along KV
@@ -114,6 +121,11 @@ addmm        bfloat16  STOCK      FAIL @B=2 max|diff|=0.0156
 addmm        bfloat16  INVARIANT  pass
 addmm        float32   STOCK      FAIL @B=2 max|diff|=5.25e-06
 addmm        float32   INVARIANT  pass
+qmatmul_4b   float16   STOCK      FAIL @B=2 max|diff|=0.125
+qmatmul_4b   bfloat16  STOCK      FAIL @B=16 max|diff|=1
+qmatmul_4b   float32   STOCK      FAIL @B=2 max|diff|=0.000534
+qmatmul_8b   *         STOCK      FAIL @B=2
+qmatmul_*    *         INVARIANT  pass
 rms_norm     *         STOCK      pass
 rms_norm     *         INVARIANT  pass
 sdpa_decode  *         STOCK      pass        (also at KV length 4k, 16k, 64k)
@@ -142,10 +154,26 @@ INVARIANT  B=16   pass
 INVARIANT  B=64   pass
 ```
 
-No fallbacks were recorded in invariant mode, so every matmul, norm and
-attention call in the model went through the batch-invariant kernels. Block
-0 diverging under stock MLX is the GEMM result above showing up at the first
-`nn.Linear`.
+Same model quantized locally to 4-bit affine, group 64 (`mlx_lm convert -q`,
+4.5 bits/weight), both modes: identical table, STOCK diverges at block 0,
+INVARIANT passes at B=4/16/64 with no fallbacks.
+
+No fallbacks were recorded in invariant mode, so every matmul, quantized
+matmul, norm and attention call in the model went through the
+batch-invariant kernels. Block 0 diverging under stock MLX is the GEMM
+result above showing up at the first linear layer.
+
+### Speed (K=N=4096, fp16, M4, per call)
+
+| M   | dense stock | dense invariant | 4-bit stock | 4-bit invariant |
+|-----|-------------|-----------------|-------------|-----------------|
+| 1   | 0.62 ms     | 2.08 ms (3.4x)  | 0.48 ms     | 2.61 ms (5.4x)  |
+| 64  | 0.97 ms     | 2.01 ms (2.1x)  | 1.01 ms     | 2.28 ms (2.3x)  |
+| 512 | 4.92 ms     | 12.29 ms (2.5x) | 5.35 ms     | 14.26 ms (2.7x) |
+
+Decode (M=1) is the worst case: the kernel is a plain 64×64 tile with
+scalar loads and no simdgroup matrix ops, and at M=1 it wastes 63/64 of each
+tile. Performance work is the next item.
 
 Takeaways: on MLX the batch dependence is in the GEMM (stock
 `mx.matmul` already differs between batch 1 and batch 2, K=N=4096). Stock
@@ -164,11 +192,12 @@ bits across machines.
 
 1. ~~Prefill attention with chunk invariance.~~ Done; see structure checks.
 2. ~~Run `model_sweep` on an unquantized checkpoint.~~ Done; clean.
-3. **`mx.quantized_matmul`**: affine-dequant + fixed-order accumulate, so
-   4-bit checkpoints are covered. Likely the most-used path on Macs.
+3. ~~`mx.quantized_matmul` (affine 4/8-bit).~~ Done; clean on a 4-bit model.
 4. **Performance**: simdgroup matmul tiles with a fixed K order, vectorized
-   loads, a threadgroup-per-(b,h,split) attention kernel instead of one
-   thread. Target: within ~20–30% of stock, as the original work reports.
+   and word-at-a-time dequant loads, a skinny-M path for decode (M ≤ 8) that
+   keeps the same per-element K order, a threadgroup-per-(b,h,split)
+   attention kernel instead of one thread. Target: within ~20–30% of stock,
+   as the original work reports.
 5. **`mx.compile` interplay**: make sure graphs compiled inside the mode keep
    the invariant ops, or document that compilation must happen inside the
    `with` block.
@@ -178,7 +207,8 @@ bits across machines.
 7. Model-level decode-vs-prefill check: logits for token `t` from a full
    prefill vs. from decoding tokens one at a time. The attention kernels
    guarantee it per op; the harness should assert it per model.
-8. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
+8. Other quantization modes (`mxfp4`, `mxfp8`, `nvfp4`) and `transpose=False`.
+9. Try other architectures in `model_sweep` (Llama, Gemma, Mistral) and
    fp16 weights; the Recorder hooks the block class, so most should work.
 
 ## Layout

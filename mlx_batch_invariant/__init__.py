@@ -13,6 +13,7 @@ from .kernels import (
     batch_invariant_decode_attention,
     batch_invariant_prefill_attention,
     batch_invariant_matmul,
+    batch_invariant_quantized_matmul,
     batch_invariant_rms_norm,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "reset_stats",
     "batch_invariant_matmul",
     "batch_invariant_rms_norm",
+    "batch_invariant_quantized_matmul",
     "batch_invariant_decode_attention",
     "batch_invariant_prefill_attention",
     "batch_invariant_attention",

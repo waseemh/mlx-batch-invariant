@@ -1,4 +1,5 @@
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 import mlx_batch_invariant as bi
@@ -26,6 +27,31 @@ def test_invariant_kernels_match_stock_within_tolerance(op_name):
     mx.eval(ref, got)
     rel = (mx.abs(ref - got).max() / (mx.abs(ref).max() + 1e-6)).item()
     assert rel < 1e-4, rel
+
+
+@pytest.mark.parametrize("bits,gs", [(4, 32), (4, 64), (4, 128), (8, 32), (8, 64), (8, 128)])
+@pytest.mark.parametrize("dt", [mx.float16, mx.bfloat16])
+def test_quantized_matmul_matches_stock(bits, gs, dt):
+    mx.random.seed(5)
+    K, N = 1024, 200
+    W = mx.random.normal((N, K)).astype(dt)
+    wq, sc, bi_ = mx.quantize(W, group_size=gs, bits=bits)
+    x = mx.random.normal((9, K)).astype(dt)
+    ref = mx.quantized_matmul(x, wq, sc, bi_, transpose=True, group_size=gs, bits=bits)
+    got = bi.batch_invariant_quantized_matmul(x, wq, sc, bi_, group_size=gs, bits=bits)
+    mx.eval(ref, got)
+    rel = (mx.abs(ref.astype(mx.float32) - got.astype(mx.float32)).max() / mx.abs(ref.astype(mx.float32)).max()).item()
+    assert rel < 2e-3, rel
+
+
+def test_quantized_linear_routes_through_mode():
+    lin = nn.QuantizedLinear(256, 64, group_size=64, bits=4)
+    x = mx.random.normal((3, 256)).astype(mx.float16)
+    bi.reset_stats()
+    with bi.set_batch_invariant_mode(strict=True):
+        y = lin(x)
+    mx.eval(y)
+    assert bi.stats()["handled"].get("quantized_matmul") == 1
 
 
 def test_mode_patches_and_restores():

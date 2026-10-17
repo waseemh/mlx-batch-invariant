@@ -90,6 +90,25 @@ class Addmm(Matmul):
         return self.lin(batch)
 
 
+class QuantizedMatmul(Matmul):
+    name = "qmatmul_4b"
+    bits, gs = 4, 64
+
+    def setup(self):
+        super().setup()
+        self.wq, self.sc, self.bi = mx.quantize(self.W, group_size=self.gs, bits=self.bits)
+
+    def run(self, batch):
+        return mx.quantized_matmul(
+            batch, self.wq, self.sc, self.bi, transpose=True, group_size=self.gs, bits=self.bits
+        )
+
+
+class QuantizedMatmul8(QuantizedMatmul):
+    name = "qmatmul_8b"
+    bits, gs = 8, 32
+
+
 class RMSNorm(Op):
     name = "rms_norm"
     D = 4096
@@ -156,7 +175,7 @@ class SDPAPrefill(Op):
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.D ** -0.5, mask="causal")
 
 
-OPS = {c.name: c for c in (Matmul, Addmm, RMSNorm, SDPADecode, SDPAPrefill)}
+OPS = {c.name: c for c in (Matmul, Addmm, QuantizedMatmul, QuantizedMatmul8, RMSNorm, SDPADecode, SDPAPrefill)}
 
 
 # ---- sequence-structure checks (attention only) -----------------------------

@@ -15,8 +15,10 @@ import mlx.core as mx
 from .kernels import (
     batch_invariant_attention,
     batch_invariant_matmul,
+    batch_invariant_quantized_matmul,
     batch_invariant_rms_norm,
 )
+from .kernels import quantized as _quant
 from .kernels import attention as _attn
 
 # Stock implementations, captured at import so patching never recurses.
@@ -24,6 +26,7 @@ _orig_matmul = mx.matmul
 _orig_addmm = mx.addmm
 _orig_rms_norm = mx.fast.rms_norm
 _orig_sdpa = mx.fast.scaled_dot_product_attention
+_orig_quantized_matmul = mx.quantized_matmul
 
 handled: Counter = Counter()
 fallbacks: Counter = Counter()
@@ -57,6 +60,21 @@ def addmm(c, a, b, /, alpha: float = 1.0, beta: float = 1.0, *, stream=None):
         return prod + (c if beta == 1.0 else c * beta)
     _fallback("addmm", "non-2d-rhs-or-non-float")
     return _orig_addmm(c, a, b, alpha, beta, stream=stream)
+
+
+def quantized_matmul(
+    x, w, /, scales, biases=None, transpose: bool = True, group_size=None, bits=None,
+    mode: str = "affine", *, stream=None,
+):
+    gs = 64 if group_size is None else group_size
+    b = 4 if bits is None else bits
+    if _quant.supports(x, w, scales, biases, transpose, gs, b, mode):
+        handled["quantized_matmul"] += 1
+        return batch_invariant_quantized_matmul(x, w, scales, biases, group_size=gs, bits=b)
+    _fallback("quantized_matmul", f"{mode}-{b}bit-g{gs}-{'T' if transpose else 'N'}")
+    return _orig_quantized_matmul(
+        x, w, scales, biases, transpose=transpose, group_size=group_size, bits=bits, mode=mode, stream=stream
+    )
 
 
 def rms_norm(x, weight, eps: float, *, stream=None):
